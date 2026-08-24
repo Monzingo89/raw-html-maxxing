@@ -183,6 +183,7 @@ async function serveStatic(pathname, res) {
     "/styles.css": ["styles.css", "text/css; charset=utf-8"],
     "/app.js": ["app.js", "text/javascript; charset=utf-8"],
     "/config.js": ["config.js", "text/javascript; charset=utf-8"],
+    "/favicon.ico": ["favicon.ico", "image/x-icon"],
     "/reference/pikachu-vmax-promo-sold.html": ["reference/pikachu-vmax-promo-sold.html", "text/html; charset=utf-8"]
   };
   const entry = files[pathname];
