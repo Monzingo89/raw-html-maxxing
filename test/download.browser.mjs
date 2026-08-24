@@ -6,7 +6,7 @@ import path from "node:path";
 import { chromium } from "playwright";
 
 const root = path.resolve(import.meta.dirname, "..");
-const publicDir = path.join(root, "public");
+const publicDir = path.resolve(root, process.env.SITE_DIR || "public");
 const expectedPath = path.join(root, "reference/ebay-full-html/pikachu-vmax-promo-sold.html");
 const testUrl = "https://www.ebay.com/sch/183454/i.html?_from=R40&_dmd=1&_nkw=pikachu+vmax+promo&rt=nc&LH_Sold=1";
 const mime = {
@@ -70,6 +70,7 @@ try {
 
   console.log(JSON.stringify({
     passed: true,
+    siteDirectory: path.relative(root, publicDir),
     filename: download.suggestedFilename(),
     bytes: actual.length,
     sha256: digest(actual),

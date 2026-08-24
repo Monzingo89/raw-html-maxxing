@@ -30,19 +30,19 @@ to keep the persistent browser profile safe.
 
 ## Publish the frontend with GitHub Pages
 
-GitHub Pages only hosts static files; Chromium must run in a separate backend.
-Deploy this repository as a Node/Docker service first, then create this GitHub
-repository variable:
+The ready-to-publish static site is in `docs/`, so it can deploy directly from
+the repository without a custom workflow:
 
-- `RAW_HTML_API_URL`: the public backend origin, such as
-  `https://raw-html.example.com`
+1. Open **Settings → Pages**.
+2. Set **Source** to **Deploy from a branch**.
+3. Select the `main` branch and the `/docs` folder.
+4. Choose **Save**.
 
-The included `Deploy GitHub Pages` workflow injects that value into the static
-frontend. `RAW_HTML_API_URL` is a repository **variable**, not a secret. No API
-key or eBay cookie is required for the bundled Pikachu acceptance URL.
+No custom domain, GitHub secret, repository variable, API key, or eBay cookie
+is required for the bundled Pikachu acceptance URL.
 
-In GitHub, open **Settings → Pages → Build and deployment**, select **GitHub
-Actions**, then run the workflow or push to `main`.
+GitHub Pages only hosts static files. Live captures for other URLs require a
+separately hosted Chromium backend and a matching API address in `config.js`.
 
 ## Deploy the backend
 
