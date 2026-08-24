@@ -5,16 +5,6 @@ const status = document.querySelector("#status");
 
 let loading = false;
 
-const referenceDownloads = new Map([
-  [
-    "https://www.ebay.com/sch/183454/i.html?_from=R40&_dmd=1&_nkw=pikachu+vmax+promo&rt=nc&LH_Sold=1",
-    {
-      path: "./reference/pikachu-vmax-promo-sold.html",
-      filename: "pikachu-vmax-promo-sold.html"
-    }
-  ]
-]);
-
 function apiUrl(path) {
   const configured = String(window.RAW_HTML_CONFIG?.apiBaseUrl || "").trim();
   return `${configured.replace(/\/$/, "")}${path}`;
@@ -22,14 +12,6 @@ function apiUrl(path) {
 
 function updateButton() {
   button.disabled = loading || input.value.trim().length === 0;
-}
-
-function referenceDownload(url) {
-  try {
-    return referenceDownloads.get(new URL(url).href) || null;
-  } catch {
-    return null;
-  }
 }
 
 function filenameFromResponse(response) {
@@ -71,21 +53,18 @@ form.addEventListener("submit", async (event) => {
   updateButton();
 
   try {
-    const reference = referenceDownload(url);
-    const response = reference
-      ? await fetch(reference.path)
-      : await fetch(apiUrl("/api/fetch"), {
-          method: "POST",
-          headers: { "content-type": "application/json" },
-          body: JSON.stringify({ url })
-        });
+    const response = await fetch(apiUrl("/api/fetch"), {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ url })
+    });
 
     if (!response.ok) {
       throw new Error((await response.text()) || `Request failed (${response.status})`);
     }
 
     const blob = await response.blob();
-    download(blob, reference?.filename || filenameFromResponse(response));
+    download(blob, filenameFromResponse(response));
     status.textContent = `Downloaded ${Math.max(1, Math.round(blob.size / 1024)).toLocaleString()} KB of HTML.`;
   } catch (error) {
     status.dataset.state = "error";

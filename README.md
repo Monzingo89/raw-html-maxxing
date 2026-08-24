@@ -7,13 +7,8 @@ DOM with `page.content()`, and downloads the result as an `.html` file.
 The repository includes the original capture script and all 14 reference HTML
 files from `data/quick-grade/testing/ebay-full-html` under `reference/`.
 
-The Pikachu acceptance URL is bundled with the static frontend. Entering this
-exact URL downloads `pikachu-vmax-promo-sold.html` directly, including on
-GitHub Pages:
-
-```text
-https://www.ebay.com/sch/183454/i.html?_from=R40&_dmd=1&_nkw=pikachu+vmax+promo&rt=nc&LH_Sold=1
-```
+Every accepted eBay URL is sent to the configured Chromium backend. There are
+no URL-specific downloads or hardcoded search results in the frontend.
 
 ## Run locally
 
@@ -39,10 +34,10 @@ the repository without a custom workflow:
 4. Choose **Save**.
 
 No custom domain, GitHub secret, repository variable, API key, or eBay cookie
-is required for the bundled Pikachu acceptance URL.
+is exposed to the frontend.
 
-GitHub Pages only hosts static files. Live captures for other URLs require a
-separately hosted Chromium backend and a matching API address in `config.js`.
+GitHub Pages hosts the frontend. Live captures use the separately hosted
+Chromium backend configured in `config.js`.
 
 ## Deploy the backend
 

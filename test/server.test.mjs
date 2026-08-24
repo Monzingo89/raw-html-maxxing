@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { outputFilename, parseAndValidateTargetUrl, parseArgs } from "../src/server.mjs";
+import { createRateLimiter, outputFilename, parseAndValidateTargetUrl, parseArgs } from "../src/server.mjs";
 
 test("accepts eBay and its subdomains", () => {
   assert.equal(
@@ -26,4 +26,12 @@ test("environment and CLI options are parsed", () => {
   assert.equal(args.headless, true);
   assert.equal(args.port, 9000);
   assert.deepEqual(args.allowHosts, ["ebay.com"]);
+});
+
+test("rate limiter resets after its window", () => {
+  const limiter = createRateLimiter(2, 1_000);
+  assert.equal(limiter.consume("client", 0).allowed, true);
+  assert.equal(limiter.consume("client", 1).allowed, true);
+  assert.equal(limiter.consume("client", 2).allowed, false);
+  assert.equal(limiter.consume("client", 1_000).allowed, true);
 });

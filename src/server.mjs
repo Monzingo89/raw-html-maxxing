@@ -25,6 +25,8 @@ export function parseArgs(argv, env = process.env) {
     userDataDir: path.resolve(env.USER_DATA_DIR || path.join(rootDir, ".tmp/browser-profile")),
     navTimeoutMs: Number(env.NAV_TIMEOUT_MS || 90_000),
     settleMs: Number(env.SETTLE_MS || 1_000),
+    rateLimitMax: Number(env.RATE_LIMIT_MAX || 30),
+    rateLimitWindowMs: Number(env.RATE_LIMIT_WINDOW_MS || 3_600_000),
     allowHosts: String(env.ALLOW_HOSTS || "ebay.com,www.ebay.com")
       .split(",")
       .map((value) => value.trim().toLowerCase())
@@ -67,8 +69,31 @@ export function parseArgs(argv, env = process.env) {
   if (!Number.isInteger(args.port) || args.port < 1 || args.port > 65_535) throw new Error("Port must be between 1 and 65535");
   if (!Number.isFinite(args.navTimeoutMs) || args.navTimeoutMs < 10_000) throw new Error("Navigation timeout must be at least 10000ms");
   if (!Number.isFinite(args.settleMs) || args.settleMs < 0) throw new Error("Settle time cannot be negative");
+  if (!Number.isInteger(args.rateLimitMax) || args.rateLimitMax < 1) throw new Error("Rate limit must be a positive integer");
+  if (!Number.isFinite(args.rateLimitWindowMs) || args.rateLimitWindowMs < 1_000) throw new Error("Rate-limit window must be at least 1000ms");
   if (args.allowHosts.length === 0) throw new Error("At least one allowed host is required");
   return args;
+}
+
+export function createRateLimiter(maxRequests, windowMs) {
+  const clients = new Map();
+  return {
+    consume(key, now = Date.now()) {
+      const current = clients.get(key);
+      if (!current || now >= current.resetAt) {
+        clients.set(key, { count: 1, resetAt: now + windowMs });
+        return { allowed: true, retryAfterSeconds: 0 };
+      }
+      if (current.count >= maxRequests) {
+        return {
+          allowed: false,
+          retryAfterSeconds: Math.max(1, Math.ceil((current.resetAt - now) / 1_000))
+        };
+      }
+      current.count += 1;
+      return { allowed: true, retryAfterSeconds: 0 };
+    }
+  };
 }
 
 export function parseAndValidateTargetUrl(input, allowHosts) {
@@ -196,6 +221,7 @@ async function serveStatic(pathname, res) {
 
 export async function runServer(args) {
   const session = await createCaptureSession(args);
+  const rateLimiter = createRateLimiter(args.rateLimitMax, args.rateLimitWindowMs);
   const server = http.createServer(async (req, res) => {
     setCors(req, res, args.corsOrigins);
     if (req.method === "OPTIONS") {
@@ -213,6 +239,19 @@ export async function runServer(args) {
       }
 
       if ((req.method === "POST" || req.method === "GET") && requestUrl.pathname === "/api/fetch") {
+        const clientIp = String(req.headers["x-forwarded-for"] || req.socket.remoteAddress || "unknown")
+          .split(",")[0]
+          .trim();
+        const rate = rateLimiter.consume(clientIp);
+        if (!rate.allowed) {
+          res.writeHead(429, {
+            "content-type": "text/plain; charset=utf-8",
+            "cache-control": "no-store",
+            "retry-after": String(rate.retryAfterSeconds)
+          });
+          res.end("Too many captures. Try again later.");
+          return;
+        }
         const input = req.method === "POST" ? (await readJson(req)).url : requestUrl.searchParams.get("url");
         const targetUrl = parseAndValidateTargetUrl(input, args.allowHosts);
         const html = await session.captureRawHtml(targetUrl);

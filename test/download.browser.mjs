@@ -8,7 +8,7 @@ import { chromium } from "playwright";
 const root = path.resolve(import.meta.dirname, "..");
 const publicDir = path.resolve(root, process.env.SITE_DIR || "public");
 const expectedPath = path.join(root, "reference/ebay-full-html/pikachu-vmax-promo-sold.html");
-const testUrl = "https://www.ebay.com/sch/183454/i.html?_from=R40&_dmd=1&_nkw=pikachu+vmax+promo&rt=nc&LH_Sold=1";
+const testUrl = "https://www.ebay.com/sch/i.html?_nkw=baseball+cards&LH_Sold=1";
 const mime = {
   ".html": "text/html; charset=utf-8",
   ".css": "text/css; charset=utf-8",
@@ -47,6 +47,20 @@ try {
   page.on("console", (message) => {
     if (message.type() === "error") consoleErrors.push(message.text());
   });
+  let submittedUrl = null;
+  await page.route("**/api/fetch", async (route) => {
+    submittedUrl = JSON.parse(route.request().postData() || "{}").url;
+    await route.fulfill({
+      status: 200,
+      contentType: "text/html; charset=utf-8",
+      headers: {
+        "access-control-allow-origin": "*",
+        "access-control-expose-headers": "content-disposition",
+        "content-disposition": "attachment; filename=baseball-cards.html"
+      },
+      body: await fs.readFile(expectedPath)
+    });
+  });
   await page.goto(`http://127.0.0.1:${server.address().port}`, { waitUntil: "networkidle" });
   const screenshotPath = path.join(root, ".tmp/pikachu-acceptance.png");
   await fs.mkdir(path.dirname(screenshotPath), { recursive: true });
@@ -61,9 +75,10 @@ try {
   const downloadPath = await download.path();
   const [actual, expected] = await Promise.all([fs.readFile(downloadPath), fs.readFile(expectedPath)]);
 
-  assert.equal(download.suggestedFilename(), "pikachu-vmax-promo-sold.html");
+  assert.equal(download.suggestedFilename(), "baseball-cards.html");
   assert.equal(actual.length, expected.length);
   assert.equal(digest(actual), digest(expected));
+  assert.equal(submittedUrl, testUrl);
   assert.equal(await page.locator("#url-input").inputValue(), "");
   assert.equal(await page.locator("#fetch-button").isDisabled(), true);
   assert.deepEqual(consoleErrors, []);
@@ -71,6 +86,7 @@ try {
   console.log(JSON.stringify({
     passed: true,
     siteDirectory: path.relative(root, publicDir),
+    submittedUrl,
     filename: download.suggestedFilename(),
     bytes: actual.length,
     sha256: digest(actual),

@@ -1,3 +1,3 @@
 window.RAW_HTML_CONFIG = {
-  apiBaseUrl: ""
+  apiBaseUrl: "https://raw-html-maxxing-dd899e.centralus.cloudapp.azure.com"
 };
