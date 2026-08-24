@@ -83,13 +83,23 @@ Requires=raw-html-display.service
 [Service]
 Type=simple
 User=rawhtml
-ExecStart=/usr/bin/x11vnc -display :99 -localhost -forever -shared -nopw -rfbport 5900
+ExecStart=/usr/bin/x11vnc -display :99 -localhost -forever -shared -rfbauth /etc/raw-html-vnc.pass -rfbport 5900
 Restart=always
 RestartSec=2
 
 [Install]
 WantedBy=multi-user.target
 UNIT
+
+if [[ ! -s /etc/raw-html-vnc.pass ]]; then
+  if [[ -z "${VNC_PASSWORD:-}" ]]; then
+    echo "Set VNC_PASSWORD when bootstrapping a new VM." >&2
+    exit 1
+  fi
+  x11vnc -storepasswd "${VNC_PASSWORD}" /etc/raw-html-vnc.pass
+fi
+chown rawhtml:rawhtml /etc/raw-html-vnc.pass
+chmod 600 /etc/raw-html-vnc.pass
 
 cat > /etc/systemd/system/raw-html-maxxing.service <<'UNIT'
 [Unit]
