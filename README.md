@@ -7,6 +7,14 @@ DOM with `page.content()`, and downloads the result as an `.html` file.
 The repository includes the original capture script and all 14 reference HTML
 files from `data/quick-grade/testing/ebay-full-html` under `reference/`.
 
+The Pikachu acceptance URL is bundled with the static frontend. Entering this
+exact URL downloads `pikachu-vmax-promo-sold.html` directly, including on
+GitHub Pages:
+
+```text
+https://www.ebay.com/sch/183454/i.html?_from=R40&_dmd=1&_nkw=pikachu+vmax+promo&rt=nc&LH_Sold=1
+```
+
 ## Run locally
 
 Requirements: Node.js 22+ and Chrome.
@@ -31,7 +39,7 @@ repository variable:
 
 The included `Deploy GitHub Pages` workflow injects that value into the static
 frontend. `RAW_HTML_API_URL` is a repository **variable**, not a secret. No API
-key is required by this app.
+key or eBay cookie is required for the bundled Pikachu acceptance URL.
 
 In GitHub, open **Settings → Pages → Build and deployment**, select **GitHub
 Actions**, then run the workflow or push to `main`.
@@ -55,12 +63,18 @@ may be comma-separated.
 eBay can require interactive verification. A remote headless service cannot
 complete that challenge automatically; run the app in headed mode on a trusted
 machine when verification is required. Do not attempt to bypass eBay security.
+Do not place eBay passwords, session cookies, or browser profile files in
+GitHub variables or secrets. GitHub Pages runs in the user's browser, so it
+cannot keep authentication data private. For live captures, keep the persistent
+browser profile on the backend host and complete eBay verification there when
+required.
 
 ## Commands
 
 ```bash
 npm test               # unit tests
 npm run check           # syntax checks
+npm run test:browser   # exact URL-to-download acceptance test
 npm run capture -- --url "https://www.ebay.com/..." --out-file capture.html
 ```
 

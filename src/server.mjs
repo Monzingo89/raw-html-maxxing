@@ -182,7 +182,8 @@ async function serveStatic(pathname, res) {
     "/index.html": ["index.html", "text/html; charset=utf-8"],
     "/styles.css": ["styles.css", "text/css; charset=utf-8"],
     "/app.js": ["app.js", "text/javascript; charset=utf-8"],
-    "/config.js": ["config.js", "text/javascript; charset=utf-8"]
+    "/config.js": ["config.js", "text/javascript; charset=utf-8"],
+    "/reference/pikachu-vmax-promo-sold.html": ["reference/pikachu-vmax-promo-sold.html", "text/html; charset=utf-8"]
   };
   const entry = files[pathname];
   if (!entry) return false;
