@@ -131,11 +131,26 @@ export function isInteractiveBlock(title, body, url) {
     || /signin\.ebay\.com|\/splashui\/captcha/i.test(url);
 }
 
-async function captureStablePageContent(page, args) {
+export function minimumCaptureLength(targetUrl) {
+  const parsed = new URL(targetUrl);
+  return /\/sch(?:\/|$)/i.test(parsed.pathname) ? 250_000 : 25_000;
+}
+
+async function waitForCaptureReady(page, targetUrl, args) {
+  const minimumLength = minimumCaptureLength(targetUrl);
+  await page.waitForFunction(
+    (minimum) => (document.documentElement?.outerHTML.length || 0) >= minimum,
+    minimumLength,
+    { timeout: args.navTimeoutMs }
+  );
+}
+
+async function captureStablePageContent(page, targetUrl, args) {
   let lastError;
   for (let attempt = 0; attempt < 10; attempt += 1) {
     await page.waitForLoadState("domcontentloaded", { timeout: 5_000 }).catch(() => {});
     await waitForManualVerification(page, args);
+    await waitForCaptureReady(page, targetUrl, args);
     if (args.settleMs > 0) await page.waitForTimeout(args.settleMs);
 
     try {
@@ -144,6 +159,7 @@ async function captureStablePageContent(page, args) {
       // before returning a sign-in or verification page as the requested HTML.
       await waitForManualVerification(page, args);
       if (page.url().includes("signin.ebay.com")) continue;
+      if (html.length < minimumCaptureLength(targetUrl)) continue;
       return html;
     } catch (error) {
       lastError = error;
@@ -189,7 +205,7 @@ export async function createCaptureSession(args) {
   const captureRawHtml = (targetUrl) => {
     const capture = async () => {
       await page.goto(targetUrl, { waitUntil: "domcontentloaded", timeout: args.navTimeoutMs });
-      return captureStablePageContent(page, args);
+      return captureStablePageContent(page, targetUrl, args);
     };
     const result = queue.then(capture, capture);
     queue = result.then(() => undefined, () => undefined);
