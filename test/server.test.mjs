@@ -16,9 +16,10 @@ test("rejects lookalike, unsupported, and malformed URLs", () => {
 });
 
 test("creates a safe descriptive HTML filename", () => {
-  const name = outputFilename("https://www.ebay.com/sch/i.html?_nkw=Pikachu%20VMAX%20Promo");
-  assert.match(name, /^pikachu-vmax-promo-.*\.html$/);
+  const name = outputFilename("https://www.ebay.com/sch/i.html?_nkw=Pikachu%20VMAX%20Promo&LH_Sold=1");
+  assert.equal(name, "pikachu-vmax-promo-sold.html");
   assert.doesNotMatch(name, /[/:]/);
+  assert.equal(outputFilename("https://www.ebay.com/sch/i.html?_nkw=Charizard"), "charizard.html");
 });
 
 test("environment and CLI options are parsed", () => {

@@ -121,7 +121,8 @@ export function outputFilename(targetUrl) {
     .replace(/[^a-z0-9]+/g, "-")
     .replace(/^-|-$/g, "")
     .slice(0, 72) || "capture";
-  return `${slug}-${new Date().toISOString().replace(/[:.]/g, "-")}.html`;
+  const soldSuffix = parsed.searchParams.get("LH_Sold") === "1" ? "-sold" : "";
+  return `${slug}${soldSuffix}.html`;
 }
 
 export function isInteractiveBlock(title, body, url) {
