@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { createRateLimiter, outputFilename, parseAndValidateTargetUrl, parseArgs } from "../src/server.mjs";
+import { createRateLimiter, isInteractiveBlock, outputFilename, parseAndValidateTargetUrl, parseArgs } from "../src/server.mjs";
 
 test("accepts eBay and its subdomains", () => {
   assert.equal(
@@ -34,4 +34,9 @@ test("rate limiter resets after its window", () => {
   assert.equal(limiter.consume("client", 1).allowed, true);
   assert.equal(limiter.consume("client", 2).allowed, false);
   assert.equal(limiter.consume("client", 1_000).allowed, true);
+});
+
+test("recognizes eBay sign-in and verification pages", () => {
+  assert.equal(isInteractiveBlock("Sign in or Register | eBay", "", "https://signin.ebay.com/ws/eBayISAPI.dll"), true);
+  assert.equal(isInteractiveBlock("Pikachu VMAX Promo for sale | eBay", "Results", "https://www.ebay.com/sch/i.html"), false);
 });

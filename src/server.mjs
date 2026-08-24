@@ -122,10 +122,33 @@ export function outputFilename(targetUrl) {
   return `${slug}-${new Date().toISOString().replace(/[:.]/g, "-")}.html`;
 }
 
-function isInteractiveBlock(title, body, url) {
+export function isInteractiveBlock(title, body, url) {
   return /security measure|sign in or register|verification required/i.test(title)
     || /verify yourself|verify you are human|pardon our interruption|robot check|captcha/i.test(body)
     || /signin\.ebay\.com|\/splashui\/captcha/i.test(url);
+}
+
+async function captureStablePageContent(page, args) {
+  let lastError;
+  for (let attempt = 0; attempt < 10; attempt += 1) {
+    await page.waitForLoadState("domcontentloaded", { timeout: 5_000 }).catch(() => {});
+    await waitForManualVerification(page, args.headless);
+    if (args.settleMs > 0) await page.waitForTimeout(args.settleMs);
+
+    try {
+      const html = await page.content();
+      // eBay can redirect after DOMContentLoaded, so inspect again immediately
+      // before returning a sign-in or verification page as the requested HTML.
+      await waitForManualVerification(page, args.headless);
+      if (page.url().includes("signin.ebay.com")) continue;
+      return html;
+    } catch (error) {
+      lastError = error;
+      if (!/navigating|changing the content/i.test(String(error?.message || error))) throw error;
+      await page.waitForTimeout(1_000);
+    }
+  }
+  throw lastError || new Error("The eBay page did not finish navigating");
 }
 
 async function waitForManualVerification(page, headless) {
@@ -159,9 +182,7 @@ export async function createCaptureSession(args) {
   const captureRawHtml = (targetUrl) => {
     const capture = async () => {
       await page.goto(targetUrl, { waitUntil: "domcontentloaded", timeout: args.navTimeoutMs });
-      await waitForManualVerification(page, args.headless);
-      if (args.settleMs > 0) await page.waitForTimeout(args.settleMs);
-      return page.content();
+      return captureStablePageContent(page, args);
     };
     const result = queue.then(capture, capture);
     queue = result.then(() => undefined, () => undefined);
