@@ -25,6 +25,7 @@ export function parseArgs(argv, env = process.env) {
     userDataDir: path.resolve(env.USER_DATA_DIR || path.join(rootDir, ".tmp/browser-profile")),
     navTimeoutMs: Number(env.NAV_TIMEOUT_MS || 90_000),
     settleMs: Number(env.SETTLE_MS || 1_000),
+    verificationTimeoutMs: Number(env.VERIFICATION_TIMEOUT_MS || 60_000),
     rateLimitMax: Number(env.RATE_LIMIT_MAX || 30),
     rateLimitWindowMs: Number(env.RATE_LIMIT_WINDOW_MS || 3_600_000),
     allowHosts: String(env.ALLOW_HOSTS || "ebay.com,www.ebay.com")
@@ -69,6 +70,7 @@ export function parseArgs(argv, env = process.env) {
   if (!Number.isInteger(args.port) || args.port < 1 || args.port > 65_535) throw new Error("Port must be between 1 and 65535");
   if (!Number.isFinite(args.navTimeoutMs) || args.navTimeoutMs < 10_000) throw new Error("Navigation timeout must be at least 10000ms");
   if (!Number.isFinite(args.settleMs) || args.settleMs < 0) throw new Error("Settle time cannot be negative");
+  if (!Number.isFinite(args.verificationTimeoutMs) || args.verificationTimeoutMs < 5_000) throw new Error("Verification timeout must be at least 5000ms");
   if (!Number.isInteger(args.rateLimitMax) || args.rateLimitMax < 1) throw new Error("Rate limit must be a positive integer");
   if (!Number.isFinite(args.rateLimitWindowMs) || args.rateLimitWindowMs < 1_000) throw new Error("Rate-limit window must be at least 1000ms");
   if (args.allowHosts.length === 0) throw new Error("At least one allowed host is required");
@@ -132,14 +134,14 @@ async function captureStablePageContent(page, args) {
   let lastError;
   for (let attempt = 0; attempt < 10; attempt += 1) {
     await page.waitForLoadState("domcontentloaded", { timeout: 5_000 }).catch(() => {});
-    await waitForManualVerification(page, args.headless);
+    await waitForManualVerification(page, args);
     if (args.settleMs > 0) await page.waitForTimeout(args.settleMs);
 
     try {
       const html = await page.content();
       // eBay can redirect after DOMContentLoaded, so inspect again immediately
       // before returning a sign-in or verification page as the requested HTML.
-      await waitForManualVerification(page, args.headless);
+      await waitForManualVerification(page, args);
       if (page.url().includes("signin.ebay.com")) continue;
       return html;
     } catch (error) {
@@ -151,7 +153,7 @@ async function captureStablePageContent(page, args) {
   throw lastError || new Error("The eBay page did not finish navigating");
 }
 
-async function waitForManualVerification(page, headless) {
+async function waitForManualVerification(page, args) {
   const inspect = async () => ({
     title: String(await page.title().catch(() => "")),
     body: String(await page.locator("body").innerText().catch(() => "")).slice(0, 2_000),
@@ -159,9 +161,13 @@ async function waitForManualVerification(page, headless) {
   });
   let state = await inspect();
   if (!isInteractiveBlock(state.title, state.body, state.url)) return;
-  if (headless) throw new Error("eBay requires interactive verification. Run the backend in headed mode and complete it in the browser window.");
+  if (args.headless) throw new Error("eBay authentication is required on the capture server.");
   console.log("[raw-html] Complete eBay verification in the opened browser window.");
+  const deadline = Date.now() + args.verificationTimeoutMs;
   while (isInteractiveBlock(state.title, state.body, state.url)) {
+    if (Date.now() >= deadline) {
+      throw new Error("eBay authentication is required on the capture server. Please contact the site operator.");
+    }
     await page.waitForTimeout(2_000);
     state = await inspect();
   }
@@ -293,8 +299,9 @@ export async function runServer(args) {
       res.end("Not found");
     } catch (error) {
       const message = String(error?.message || error);
+      const authRequired = /eBay authentication is required/i.test(message);
       const clientError = /valid URL|not allowed|HTTP|JSON|too large/i.test(message);
-      res.writeHead(clientError ? 400 : 500, { "content-type": "text/plain; charset=utf-8", "cache-control": "no-store" });
+      res.writeHead(authRequired ? 503 : clientError ? 400 : 500, { "content-type": "text/plain; charset=utf-8", "cache-control": "no-store" });
       res.end(message);
     }
   });

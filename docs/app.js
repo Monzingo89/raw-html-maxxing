@@ -52,11 +52,14 @@ form.addEventListener("submit", async (event) => {
   status.removeAttribute("data-state");
   updateButton();
 
+  const controller = new AbortController();
+  const timeout = window.setTimeout(() => controller.abort(), 75_000);
   try {
     const response = await fetch(apiUrl("/api/fetch"), {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ url })
+      body: JSON.stringify({ url }),
+      signal: controller.signal
     });
 
     if (!response.ok) {
@@ -68,10 +71,13 @@ form.addEventListener("submit", async (event) => {
     status.textContent = `Downloaded ${Math.max(1, Math.round(blob.size / 1024)).toLocaleString()} KB of HTML.`;
   } catch (error) {
     status.dataset.state = "error";
-    status.textContent = error instanceof TypeError
+    status.textContent = error?.name === "AbortError"
+      ? "The capture timed out. Please try again or contact the site operator."
+      : error instanceof TypeError
       ? "The capture service is unavailable. Check the configured backend URL."
       : String(error.message || error);
   } finally {
+    window.clearTimeout(timeout);
     loading = false;
     delete button.dataset.loading;
     button.querySelector("span:first-child").textContent = "Fetch";
