@@ -782,18 +782,6 @@ export async function runServer(args, { session: injectedSession } = {}) {
         const input = req.method === "POST" ? (await readJson(req)).url : requestUrl.searchParams.get("url");
         const targetUrl = parseAndValidateTargetUrl(input, args.allowHosts);
 
-        const requestRate = requestDailyRateLimiter.consume();
-        await persistRates();
-        if (!requestRate.allowed) {
-          res.writeHead(429, {
-            "content-type": "text/plain; charset=utf-8",
-            "cache-control": "no-store",
-            "retry-after": String(requestRate.retryAfterSeconds)
-          });
-          res.end("Daily API request limit reached. Retry after the indicated delay.");
-          return;
-        }
-
         const cachedHtml = await cache.get(targetUrl);
         if (cachedHtml !== null) {
           const filename = outputFilename(targetUrl);
@@ -826,6 +814,18 @@ export async function runServer(args, { session: injectedSession } = {}) {
             "retry-after": "10"
           });
           res.end("A capture is already running. Retry after 10 seconds.");
+          return;
+        }
+
+        const requestRate = requestDailyRateLimiter.consume();
+        await persistRates();
+        if (!requestRate.allowed) {
+          res.writeHead(429, {
+            "content-type": "text/plain; charset=utf-8",
+            "cache-control": "no-store",
+            "retry-after": String(requestRate.retryAfterSeconds)
+          });
+          res.end("Daily API request limit reached. Retry after the indicated delay.");
           return;
         }
 

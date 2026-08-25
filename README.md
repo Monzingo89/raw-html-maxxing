@@ -96,6 +96,27 @@ HTML can be large, the endpoint defaults to one item and permits at most 10 per
 response. This lets a sender receive HTML continuously as it becomes available
 without resubmitting the original 10,000 URLs.
 
+## Send URLs dynamically
+
+For URLs that arrive throughout the day, send each one to `POST /api/fetch`.
+The successful HTTP response body is the complete rendered HTML itself:
+
+```bash
+curl --fail-with-body \
+  --request POST \
+  --header 'Content-Type: application/json' \
+  --data '{"url":"https://www.ebay.com/sch/i.html?_nkw=pikachu&LH_Sold=1"}' \
+  'https://raw-html-maxxing-dd899e.centralus.cloudapp.azure.com/api/fetch' \
+  --output result.html
+```
+
+Send the next dynamic request after the prior response finishes. If a request
+returns HTTP `429`, wait for the number of seconds in its `Retry-After` header
+and retry that same URL. Accepted uncached captures count toward the shared
+10,000-capture rolling 24-hour allowance; busy retries and cache hits do not
+consume that allowance. Do not run dynamic uncached requests while a bulk batch
+is active—the batch has priority.
+
 ## Keep VM screen sharing available
 
 The VM bootstrap runs `x11vnc` with `-forever -shared` under an always-restarting

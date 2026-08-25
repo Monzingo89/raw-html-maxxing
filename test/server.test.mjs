@@ -110,7 +110,7 @@ test("POST returns HTML and caches an identical URL for 24 hours", async () => {
     ALLOW_HOSTS: "ebay.com",
     RATE_LIMIT_MAX: "30",
     GLOBAL_RATE_LIMIT_MAX: "30",
-    DAILY_RATE_LIMIT_MAX: "1000",
+    DAILY_RATE_LIMIT_MAX: "1",
     CAPTURE_DAILY_RATE_LIMIT_MAX: "300",
     CACHE_DIR: path.join(temporaryDir, "cache"),
     RATE_LIMIT_STATE_FILE: path.join(temporaryDir, "rates.json"),
@@ -138,6 +138,13 @@ test("POST returns HTML and caches an identical URL for 24 hours", async () => {
     assert.equal(second.headers.get("x-cache"), "HIT");
     assert.equal(await second.text(), html);
     assert.equal(captures, 1);
+
+    const blockedDistinct = await fetch(`http://127.0.0.1:${port}/api/fetch`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ url: "https://www.ebay.com/sch/i.html?_nkw=charizard" })
+    });
+    assert.equal(blockedDistinct.status, 429);
   } finally {
     await new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
     await fs.rm(temporaryDir, { recursive: true, force: true });

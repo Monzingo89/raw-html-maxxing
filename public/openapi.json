@@ -38,7 +38,7 @@
     "/api/fetch": {
       "post": {
         "summary": "Capture rendered HTML",
-        "description": "Accepts one eBay URL and returns the complete rendered DOM as HTML. Use the batch endpoint for multiple URLs. The production deployment allows at most 10,000 captures in a rolling 24-hour window. An active batch has priority over uncached direct requests.",
+        "description": "Dynamic request endpoint. Accepts one eBay URL and returns the complete rendered DOM directly as the text/html response body. Send the next request after the prior response finishes and honor Retry-After on HTTP 429. Accepted uncached captures count toward the shared 10,000-capture rolling 24-hour allowance; busy retries and cache hits do not. Use the batch endpoint for a one-time bulk submission. An active batch has priority over uncached dynamic requests.",
         "operationId": "captureRenderedHtml",
         "requestBody": {
           "required": true,
