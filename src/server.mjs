@@ -7,6 +7,7 @@ import { chromium } from "playwright";
 
 const rootDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const publicDir = path.join(rootDir, "public");
+const swaggerUiDir = path.join(rootDir, "node_modules", "swagger-ui-dist");
 
 function booleanFrom(value, fallback) {
   if (value === undefined) return fallback;
@@ -262,12 +263,20 @@ async function serveStatic(pathname, res) {
     "/app.js": ["app.js", "text/javascript; charset=utf-8"],
     "/config.js": ["config.js", "text/javascript; charset=utf-8"],
     "/favicon.ico": ["favicon.ico", "image/x-icon"],
-    "/reference/pikachu-vmax-promo-sold.html": ["reference/pikachu-vmax-promo-sold.html", "text/html; charset=utf-8"]
+    "/reference/pikachu-vmax-promo-sold.html": ["reference/pikachu-vmax-promo-sold.html", "text/html; charset=utf-8"],
+    "/api/docs": ["api-docs.html", "text/html; charset=utf-8"],
+    "/api/docs/": ["api-docs.html", "text/html; charset=utf-8"],
+    "/api/openapi.json": ["openapi.json", "application/json; charset=utf-8"]
   };
   const entry = files[pathname];
-  if (!entry) return false;
-  const body = await fs.readFile(path.join(publicDir, entry[0]));
-  res.writeHead(200, { "content-type": entry[1], "cache-control": "no-store" });
+  const swaggerAssets = {
+    "/api/docs/swagger-ui.css": ["swagger-ui.css", "text/css; charset=utf-8"],
+    "/api/docs/swagger-ui-bundle.js": ["swagger-ui-bundle.js", "text/javascript; charset=utf-8"]
+  };
+  const swaggerEntry = swaggerAssets[pathname];
+  if (!entry && !swaggerEntry) return false;
+  const body = await fs.readFile(path.join(swaggerEntry ? swaggerUiDir : publicDir, (swaggerEntry || entry)[0]));
+  res.writeHead(200, { "content-type": (swaggerEntry || entry)[1], "cache-control": "no-store" });
   res.end(body);
   return true;
 }

@@ -1,0 +1,154 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "Raw HTML Gateway API",
+    "version": "1.0.0",
+    "description": "Serializes the fully rendered DOM for an allowed eBay URL. This deployment uses one persistent headed browser and accepts one capture at a time. It is a raw-HTML capture service, not the eBay Marketplace Insights API."
+  },
+  "servers": [
+    {
+      "url": "https://raw-html-maxxing-dd899e.centralus.cloudapp.azure.com",
+      "description": "Production Azure gateway"
+    }
+  ],
+  "paths": {
+    "/api/health": {
+      "get": {
+        "summary": "Check gateway health",
+        "operationId": "getHealth",
+        "responses": {
+          "200": {
+            "description": "The gateway process is running.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": ["ok"],
+                  "properties": {
+                    "ok": { "type": "boolean", "const": true }
+                  }
+                },
+                "example": { "ok": true }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/fetch": {
+      "post": {
+        "summary": "Capture rendered HTML",
+        "description": "Accepts one eBay URL and returns the complete rendered DOM as HTML. Do not send parallel requests. On HTTP 429, wait for the number of seconds in Retry-After before retrying. Current service controls are 30 captures per hour per caller IP, 30 captures per hour across all callers, 300 captures per 24-hour window across all callers, and one active capture at a time. These service controls reset when the backend process restarts and are not eBay API quotas.",
+        "operationId": "captureRenderedHtml",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/CaptureRequest" },
+              "example": {
+                "url": "https://www.ebay.com/sch/182982/i.html?_from=R40&_dmd=1&_nkw=2026+topps+chrome+disney&LH_Sold=1&_ipg=240"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Complete rendered HTML.",
+            "headers": {
+              "Content-Disposition": {
+                "description": "Suggested HTML filename.",
+                "schema": { "type": "string" },
+                "example": "attachment; filename*=UTF-8''2026-topps-chrome-disney-sold.html"
+              },
+              "X-Source-URL": {
+                "description": "Validated source URL.",
+                "schema": { "type": "string", "format": "uri" }
+              },
+              "X-Bytes": {
+                "description": "Response size in bytes.",
+                "schema": { "type": "integer" }
+              },
+              "X-Rate-Limit-Policy": {
+                "description": "Aggregate gateway policy.",
+                "schema": { "type": "string" },
+                "example": "30/3600s; 300/86400s"
+              }
+            },
+            "content": {
+              "text/html": {
+                "schema": { "type": "string" }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "429": {
+            "description": "Another capture is active or a gateway rate limit was reached.",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds the caller must wait before retrying.",
+                "schema": { "type": "integer", "minimum": 1 }
+              },
+              "X-Rate-Limit-Policy": {
+                "description": "Aggregate gateway policy.",
+                "schema": { "type": "string" }
+              }
+            },
+            "content": {
+              "text/plain": {
+                "schema": { "type": "string" },
+                "examples": {
+                  "busy": { "value": "A capture is already running. Retry after 10 seconds." },
+                  "limited": { "value": "Capture rate limit reached. Retry after the indicated delay." }
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "The persistent eBay browser session requires operator authentication.",
+            "content": {
+              "text/plain": {
+                "schema": { "type": "string" },
+                "example": "eBay authentication is required on the capture server. Please contact the site operator."
+              }
+            }
+          },
+          "500": {
+            "description": "Capture failed.",
+            "content": {
+              "text/plain": { "schema": { "type": "string" } }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "CaptureRequest": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["url"],
+        "properties": {
+          "url": {
+            "type": "string",
+            "format": "uri",
+            "description": "An HTTP or HTTPS URL on ebay.com or one of its subdomains."
+          }
+        }
+      }
+    },
+    "responses": {
+      "BadRequest": {
+        "description": "Malformed JSON, invalid URL, unsupported protocol, or disallowed host.",
+        "content": {
+          "text/plain": {
+            "schema": { "type": "string" },
+            "example": "Enter a valid URL"
+          }
+        }
+      }
+    }
+  }
+}

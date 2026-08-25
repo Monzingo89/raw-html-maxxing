@@ -12,6 +12,14 @@ no URL-specific downloads or hardcoded search results in the frontend.
 
 ## Direct API
 
+Interactive Swagger documentation is hosted at:
+
+<https://raw-html-maxxing-dd899e.centralus.cloudapp.azure.com/api/docs>
+
+The machine-readable OpenAPI document is available at:
+
+<https://raw-html-maxxing-dd899e.centralus.cloudapp.azure.com/api/openapi.json>
+
 The GitHub Pages URL is only the browser interface. Server-side clients should
 send the target eBay URL as JSON to the HTTPS capture API:
 
