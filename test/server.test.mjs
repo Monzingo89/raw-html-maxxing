@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { createHtmlCache, createRateLimiter, createRollingRateLimiter, isInteractiveBlock, minimumCaptureLength, outputFilename, parseAndValidateTargetUrl, parseArgs, randomDelayMs, runServer } from "../src/server.mjs";
+import { createHtmlCache, createRateLimiter, createRollingRateLimiter, isInteractiveBlock, minimumCaptureLength, nextBatchCaptureAt, outputFilename, parseAndValidateTargetUrl, parseArgs, parseDistinctBatchUrls, randomDelayMs, runServer } from "../src/server.mjs";
 
 test("accepts eBay and its subdomains", () => {
   assert.equal(
@@ -16,6 +16,16 @@ test("rejects lookalike, unsupported, and malformed URLs", () => {
   assert.throws(() => parseAndValidateTargetUrl("https://ebay.com.attacker.test", ["ebay.com"]), /not allowed/);
   assert.throws(() => parseAndValidateTargetUrl("file:///etc/passwd", ["ebay.com"]), /HTTP/);
   assert.throws(() => parseAndValidateTargetUrl("not a url", ["ebay.com"]), /valid URL/);
+});
+
+test("accepts only distinct allowed URLs in a bounded batch", () => {
+  const urls = [
+    "https://www.ebay.com/sch/i.html?_nkw=pikachu",
+    "https://www.ebay.com/sch/i.html?_nkw=charizard"
+  ];
+  assert.deepEqual(parseDistinctBatchUrls(urls, ["ebay.com"], 2), urls);
+  assert.throws(() => parseDistinctBatchUrls([urls[0], urls[0]], ["ebay.com"], 2), /distinct/);
+  assert.throws(() => parseDistinctBatchUrls([...urls, "https://www.ebay.com/itm/1"], ["ebay.com"], 2), /cannot exceed/);
 });
 
 test("creates a safe descriptive HTML filename", () => {
@@ -37,6 +47,7 @@ test("environment and CLI options are parsed", () => {
   assert.equal(args.globalRateLimitMax, 12);
   assert.equal(args.dailyRateLimitMax, 1000);
   assert.equal(args.captureDailyRateLimitMax, 300);
+  assert.equal(args.verificationTimeoutMs, 0);
   assert.deepEqual(args.allowHosts, ["ebay.com"]);
 });
 
@@ -48,12 +59,12 @@ test("rolling limiter retains only events within the trailing window", () => {
   assert.deepEqual(limiter.snapshot(1_000), [999, 1_000]);
 });
 
-test("rolling daily limiter accepts 1,000 requests and rejects request 1,001", () => {
-  const limiter = createRollingRateLimiter(1_000, 86_400_000);
-  for (let index = 0; index < 1_000; index += 1) {
+test("rolling daily limiter accepts 10,000 requests and rejects request 10,001", () => {
+  const limiter = createRollingRateLimiter(10_000, 86_400_000);
+  for (let index = 0; index < 10_000; index += 1) {
     assert.equal(limiter.consume(index).allowed, true);
   }
-  assert.equal(limiter.consume(1_000).allowed, false);
+  assert.equal(limiter.consume(10_000).allowed, false);
   assert.equal(limiter.consume(86_400_000).allowed, true);
 });
 
@@ -74,6 +85,12 @@ test("HTML cache returns exact content until its TTL expires", async () => {
 test("capture delay stays within its inclusive configured range", () => {
   assert.equal(randomDelayMs(1_000, 3_000, () => 0), 1_000);
   assert.equal(randomDelayMs(1_000, 3_000, () => 0.999999), 3_000);
+});
+
+test("batch pacing fills an 8.64-second slot and always sleeps at least 4.64 seconds", () => {
+  assert.equal(nextBatchCaptureAt(0, 3_000, 8_640, 4_640), 8_640);
+  assert.equal(nextBatchCaptureAt(0, 4_000, 8_640, 4_640), 8_640);
+  assert.equal(nextBatchCaptureAt(0, 5_000, 8_640, 4_640), 9_640);
 });
 
 test("POST returns HTML and caches an identical URL for 24 hours", async () => {
@@ -121,6 +138,57 @@ test("POST returns HTML and caches an identical URL for 24 hours", async () => {
     assert.equal(second.headers.get("x-cache"), "HIT");
     assert.equal(await second.text(), html);
     assert.equal(captures, 1);
+  } finally {
+    await new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+    await fs.rm(temporaryDir, { recursive: true, force: true });
+  }
+});
+
+test("batch submission returns immediately and exposes completed HTML", async () => {
+  const temporaryDir = await fs.mkdtemp(path.join(os.tmpdir(), "raw-html-batch-test-"));
+  const html = "<!DOCTYPE html><html><body>batch result</body></html>";
+  const session = {
+    async captureRawHtml() { return html; },
+    async close() {}
+  };
+  const args = parseArgs([], {
+    HOST: "127.0.0.1",
+    PORT: "8787",
+    ALLOW_HOSTS: "ebay.com",
+    RATE_LIMIT_MAX: "10000",
+    GLOBAL_RATE_LIMIT_MAX: "10000",
+    DAILY_RATE_LIMIT_MAX: "10000",
+    CAPTURE_DAILY_RATE_LIMIT_MAX: "10000",
+    CACHE_DIR: path.join(temporaryDir, "cache"),
+    RATE_LIMIT_STATE_FILE: path.join(temporaryDir, "rates.json"),
+    BATCH_DIR: path.join(temporaryDir, "batches"),
+    BATCH_START_INTERVAL_MS: "1000",
+    BATCH_MINIMUM_SLEEP_MS: "0"
+  });
+  args.port = 0;
+  const server = await runServer(args, { session });
+  const port = server.address().port;
+  try {
+    const submitted = await fetch(`http://127.0.0.1:${port}/api/batches`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ urls: ["https://www.ebay.com/sch/i.html?_nkw=pikachu"] })
+    });
+    assert.equal(submitted.status, 202);
+    const accepted = await submitted.json();
+    assert.equal(accepted.total, 1);
+
+    let status;
+    for (let attempt = 0; attempt < 50; attempt += 1) {
+      status = await (await fetch(`http://127.0.0.1:${port}${accepted.statusUrl}`)).json();
+      if (status.status === "complete") break;
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    assert.equal(status.status, "complete");
+    assert.equal(status.completed, 1);
+    const result = await fetch(`http://127.0.0.1:${port}${status.items[0].resultUrl}`);
+    assert.equal(result.status, 200);
+    assert.equal(await result.text(), html);
   } finally {
     await new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
     await fs.rm(temporaryDir, { recursive: true, force: true });

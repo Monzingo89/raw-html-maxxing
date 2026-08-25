@@ -38,13 +38,63 @@ when the server returns `429`. The deployed single-browser backend accepts one
 capture at a time; parallel requests receive `429` instead of accumulating in
 an unbounded queue.
 
-The deployment accepts at most 1,000 API requests in any rolling 24-hour period.
-Successful HTML is cached by exact URL for 24 hours, and cache hits do not
-revisit eBay. Actual browser captures remain limited to 30 per hour globally,
-300 in any rolling 24 hours, and 30 per hour for each caller IP. Uncached
-captures are serialized and separated by a random 1–3 second delay. The rolling
-daily counters and cache persist across backend restarts. These are conservative
-service controls, not eBay-approved scraping limits.
+The production bootstrap accepts at most 10,000 distinct browser captures in
+any rolling 24-hour period. Batch captures target one start every 8.64 seconds
+and always sleep at least 4.64 seconds after a capture. A 3-second capture
+therefore sleeps 5.64 seconds; a 4-second capture sleeps 4.64 seconds. Longer
+captures slow the batch rather than shortening the minimum sleep. Successful
+HTML is cached by exact URL for 48 hours on the production VM. Rolling daily
+counters, batch progress, and cached HTML persist across backend restarts.
+
+## Submit up to 10,000 URLs at once
+
+Use the asynchronous batch endpoint instead of opening 10,000 simultaneous
+HTTP connections. Create `urls.json` with one `urls` array containing between 1
+and 10,000 distinct allowed URLs:
+
+```json
+{
+  "urls": [
+    "https://www.ebay.com/sch/i.html?_nkw=pikachu&LH_Sold=1",
+    "https://www.ebay.com/sch/i.html?_nkw=charizard&LH_Sold=1"
+  ]
+}
+```
+
+Submit the whole file in one request:
+
+```bash
+curl --fail-with-body \
+  --request POST \
+  --header 'Content-Type: application/json' \
+  --data-binary @urls.json \
+  'https://raw-html-maxxing-dd899e.centralus.cloudapp.azure.com/api/batches'
+```
+
+The server responds immediately with HTTP `202`, a batch `id`, and a
+`statusUrl`. Poll that URL to see every item as `queued`, `complete`, or
+`failed`. Completed items include a `resultUrl` that downloads the HTML. Only
+one batch can be active at a time. If eBay requires interactive authentication,
+the current capture and the entire queue wait indefinitely without advancing.
+Processing resumes automatically when the operator completes verification in
+the persistent browser. A batch only enters the explicit `paused` state when an
+authentication or service error escapes that live waiting loop; resume such a
+batch with `POST /api/batches/{id}/resume` after correcting the issue.
+
+## Keep VM screen sharing available
+
+The VM bootstrap runs `x11vnc` with `-forever -shared` under an always-restarting
+systemd service. It is intentionally bound to localhost, so keep an SSH tunnel
+open from the Mac and connect Screen Sharing through that tunnel:
+
+```bash
+ssh -N -L 5901:127.0.0.1:5900 azureuser@raw-html-maxxing-dd899e.centralus.cloudapp.azure.com
+open 'vnc://127.0.0.1:5901'
+```
+
+Leave both processes open while a batch is running. The VM-side VNC service
+automatically restarts if it exits; the localhost binding keeps the VNC port
+off the public internet.
 
 Do not put the eBay URL on the GitHub Pages query string. GitHub Pages is static
 and does not process `?url=...` parameters.

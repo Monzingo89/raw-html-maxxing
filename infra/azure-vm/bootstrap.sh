@@ -30,8 +30,11 @@ if ! id "$APP_USER" >/dev/null 2>&1; then
 fi
 
 if [ -d "$APP_DIR/.git" ]; then
-  git -C "$APP_DIR" fetch origin main
-  git -C "$APP_DIR" reset --hard origin/main
+  # The checkout is owned by the service account after the first bootstrap.
+  # Run Git as that same account so repeat deployments do not trip Git's
+  # dubious-ownership protection.
+  runuser -u "$APP_USER" -- git -C "$APP_DIR" fetch origin main
+  runuser -u "$APP_USER" -- git -C "$APP_DIR" reset --hard origin/main
 else
   git clone --branch main --single-branch "$REPO_URL" "$APP_DIR"
 fi
@@ -79,13 +82,14 @@ cat > /etc/systemd/system/raw-html-vnc.service <<'UNIT'
 Description=Private VNC access for eBay verification
 After=raw-html-display.service
 Requires=raw-html-display.service
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
 User=rawhtml
 ExecStart=/usr/bin/x11vnc -display :99 -localhost -forever -shared -rfbauth /etc/raw-html-vnc.pass -rfbport 5900
 Restart=always
-RestartSec=2
+RestartSec=1
 
 [Install]
 WantedBy=multi-user.target
@@ -121,20 +125,26 @@ Environment=BROWSER_CHANNEL=chrome
 Environment=USER_DATA_DIR=/var/lib/raw-html-maxxing/browser-profile
 Environment=CORS_ORIGIN=https://monzingo89.github.io
 Environment=ALLOW_HOSTS=ebay.com,www.ebay.com
-Environment=RATE_LIMIT_MAX=30
-Environment=RATE_LIMIT_WINDOW_MS=3600000
-Environment=GLOBAL_RATE_LIMIT_MAX=30
-Environment=GLOBAL_RATE_LIMIT_WINDOW_MS=3600000
-Environment=DAILY_RATE_LIMIT_MAX=1000
+Environment=RATE_LIMIT_MAX=10000
+Environment=RATE_LIMIT_WINDOW_MS=86400000
+Environment=GLOBAL_RATE_LIMIT_MAX=10000
+Environment=GLOBAL_RATE_LIMIT_WINDOW_MS=86400000
+Environment=DAILY_RATE_LIMIT_MAX=10000
 Environment=DAILY_RATE_LIMIT_WINDOW_MS=86400000
-Environment=CAPTURE_DAILY_RATE_LIMIT_MAX=300
+Environment=CAPTURE_DAILY_RATE_LIMIT_MAX=10000
 Environment=RATE_LIMIT_STATE_FILE=/var/lib/raw-html-maxxing/rate-limit-state.json
 Environment=CACHE_DIR=/var/lib/raw-html-maxxing/capture-cache
-Environment=CACHE_TTL_MS=86400000
-Environment=CAPTURE_DELAY_MIN_MS=1000
-Environment=CAPTURE_DELAY_MAX_MS=3000
+Environment=CACHE_TTL_MS=172800000
+Environment=CAPTURE_DELAY_MIN_MS=4640
+Environment=CAPTURE_DELAY_MAX_MS=5640
+Environment=BATCH_DIR=/var/lib/raw-html-maxxing/batches
+Environment=BATCH_MAX_URLS=10000
+Environment=BATCH_REQUEST_MAX_BYTES=33554432
+Environment=BATCH_START_INTERVAL_MS=8640
+Environment=BATCH_MINIMUM_SLEEP_MS=4640
 Environment=NAV_TIMEOUT_MS=90000
 Environment=SETTLE_MS=1000
+Environment=VERIFICATION_TIMEOUT_MS=0
 ExecStart=/usr/bin/node /opt/raw-html-maxxing/src/server.mjs
 Restart=on-failure
 RestartSec=5

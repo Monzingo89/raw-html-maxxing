@@ -27,19 +27,24 @@ export function parseArgs(argv, env = process.env) {
     userDataDir: path.resolve(env.USER_DATA_DIR || path.join(rootDir, ".tmp/browser-profile")),
     navTimeoutMs: Number(env.NAV_TIMEOUT_MS || 90_000),
     settleMs: Number(env.SETTLE_MS || 1_000),
-    verificationTimeoutMs: Number(env.VERIFICATION_TIMEOUT_MS || 60_000),
-    rateLimitMax: Number(env.RATE_LIMIT_MAX || 30),
-    rateLimitWindowMs: Number(env.RATE_LIMIT_WINDOW_MS || 3_600_000),
-    globalRateLimitMax: Number(env.GLOBAL_RATE_LIMIT_MAX || 30),
-    globalRateLimitWindowMs: Number(env.GLOBAL_RATE_LIMIT_WINDOW_MS || 3_600_000),
-    dailyRateLimitMax: Number(env.DAILY_RATE_LIMIT_MAX || 1_000),
+    verificationTimeoutMs: Number(env.VERIFICATION_TIMEOUT_MS ?? 0),
+    rateLimitMax: Number(env.RATE_LIMIT_MAX || 10_000),
+    rateLimitWindowMs: Number(env.RATE_LIMIT_WINDOW_MS || 86_400_000),
+    globalRateLimitMax: Number(env.GLOBAL_RATE_LIMIT_MAX || 10_000),
+    globalRateLimitWindowMs: Number(env.GLOBAL_RATE_LIMIT_WINDOW_MS || 86_400_000),
+    dailyRateLimitMax: Number(env.DAILY_RATE_LIMIT_MAX || 10_000),
     dailyRateLimitWindowMs: Number(env.DAILY_RATE_LIMIT_WINDOW_MS || 86_400_000),
-    captureDailyRateLimitMax: Number(env.CAPTURE_DAILY_RATE_LIMIT_MAX || 300),
+    captureDailyRateLimitMax: Number(env.CAPTURE_DAILY_RATE_LIMIT_MAX || 10_000),
     stateFile: path.resolve(env.RATE_LIMIT_STATE_FILE || path.join(rootDir, ".tmp/rate-limit-state.json")),
     cacheDir: path.resolve(env.CACHE_DIR || path.join(rootDir, ".tmp/capture-cache")),
-    cacheTtlMs: Number(env.CACHE_TTL_MS || 86_400_000),
-    captureDelayMinMs: Number(env.CAPTURE_DELAY_MIN_MS || 1_000),
-    captureDelayMaxMs: Number(env.CAPTURE_DELAY_MAX_MS || 3_000),
+    cacheTtlMs: Number(env.CACHE_TTL_MS || 172_800_000),
+    captureDelayMinMs: Number(env.CAPTURE_DELAY_MIN_MS || 4_640),
+    captureDelayMaxMs: Number(env.CAPTURE_DELAY_MAX_MS || 5_640),
+    batchDir: path.resolve(env.BATCH_DIR || path.join(rootDir, ".tmp/batches")),
+    batchMaxUrls: Number(env.BATCH_MAX_URLS || 10_000),
+    batchRequestMaxBytes: Number(env.BATCH_REQUEST_MAX_BYTES || 33_554_432),
+    batchStartIntervalMs: Number(env.BATCH_START_INTERVAL_MS || 8_640),
+    batchMinimumSleepMs: Number(env.BATCH_MINIMUM_SLEEP_MS || 4_640),
     allowHosts: String(env.ALLOW_HOSTS || "ebay.com,www.ebay.com")
       .split(",")
       .map((value) => value.trim().toLowerCase())
@@ -82,7 +87,9 @@ export function parseArgs(argv, env = process.env) {
   if (!Number.isInteger(args.port) || args.port < 1 || args.port > 65_535) throw new Error("Port must be between 1 and 65535");
   if (!Number.isFinite(args.navTimeoutMs) || args.navTimeoutMs < 10_000) throw new Error("Navigation timeout must be at least 10000ms");
   if (!Number.isFinite(args.settleMs) || args.settleMs < 0) throw new Error("Settle time cannot be negative");
-  if (!Number.isFinite(args.verificationTimeoutMs) || args.verificationTimeoutMs < 5_000) throw new Error("Verification timeout must be at least 5000ms");
+  if (!Number.isFinite(args.verificationTimeoutMs) || (args.verificationTimeoutMs !== 0 && args.verificationTimeoutMs < 5_000)) {
+    throw new Error("Verification timeout must be 0 (unlimited) or at least 5000ms");
+  }
   if (!Number.isInteger(args.rateLimitMax) || args.rateLimitMax < 1) throw new Error("Rate limit must be a positive integer");
   if (!Number.isFinite(args.rateLimitWindowMs) || args.rateLimitWindowMs < 1_000) throw new Error("Rate-limit window must be at least 1000ms");
   if (!Number.isInteger(args.globalRateLimitMax) || args.globalRateLimitMax < 1) throw new Error("Global rate limit must be a positive integer");
@@ -93,6 +100,10 @@ export function parseArgs(argv, env = process.env) {
   if (!Number.isFinite(args.cacheTtlMs) || args.cacheTtlMs < 1_000) throw new Error("Cache TTL must be at least 1000ms");
   if (!Number.isFinite(args.captureDelayMinMs) || args.captureDelayMinMs < 0) throw new Error("Minimum capture delay cannot be negative");
   if (!Number.isFinite(args.captureDelayMaxMs) || args.captureDelayMaxMs < args.captureDelayMinMs) throw new Error("Maximum capture delay must be at least the minimum");
+  if (!Number.isInteger(args.batchMaxUrls) || args.batchMaxUrls < 1) throw new Error("Batch URL limit must be a positive integer");
+  if (!Number.isInteger(args.batchRequestMaxBytes) || args.batchRequestMaxBytes < 1_024) throw new Error("Batch request size limit must be at least 1024 bytes");
+  if (!Number.isFinite(args.batchStartIntervalMs) || args.batchStartIntervalMs < 1_000) throw new Error("Batch start interval must be at least 1000ms");
+  if (!Number.isFinite(args.batchMinimumSleepMs) || args.batchMinimumSleepMs < 0) throw new Error("Batch minimum sleep cannot be negative");
   if (args.allowHosts.length === 0) throw new Error("At least one allowed host is required");
   return args;
 }
@@ -127,6 +138,10 @@ export function createRollingRateLimiter(maxRequests, windowMs, initialEvents = 
 
 export function randomDelayMs(minMs, maxMs, random = Math.random) {
   return Math.floor(minMs + random() * (maxMs - minMs + 1));
+}
+
+export function nextBatchCaptureAt(startedAt, finishedAt, startIntervalMs, minimumSleepMs) {
+  return Math.max(startedAt + startIntervalMs, finishedAt + minimumSleepMs);
 }
 
 function cachePath(cacheDir, targetUrl) {
@@ -250,6 +265,15 @@ export function parseAndValidateTargetUrl(input, allowHosts) {
   return parsed.toString();
 }
 
+export function parseDistinctBatchUrls(input, allowHosts, maxUrls = 10_000) {
+  if (!Array.isArray(input)) throw new Error("Batch request must include a urls array");
+  if (input.length < 1) throw new Error("Batch request must include at least one URL");
+  if (input.length > maxUrls) throw new Error(`Batch request cannot exceed ${maxUrls.toLocaleString("en-US")} URLs`);
+  const urls = input.map((value) => parseAndValidateTargetUrl(value, allowHosts));
+  if (new Set(urls).size !== urls.length) throw new Error("Batch URLs must be distinct");
+  return urls;
+}
+
 export function outputFilename(targetUrl) {
   const parsed = new URL(targetUrl);
   const query = parsed.searchParams.get("_nkw") || parsed.pathname.split("/").filter(Boolean).pop() || parsed.hostname;
@@ -317,9 +341,9 @@ async function waitForManualVerification(page, args) {
   if (!isInteractiveBlock(state.title, state.body, state.url)) return;
   if (args.headless) throw new Error("eBay authentication is required on the capture server.");
   console.log("[raw-html] Complete eBay verification in the opened browser window.");
-  const deadline = Date.now() + args.verificationTimeoutMs;
+  const deadline = args.verificationTimeoutMs === 0 ? null : Date.now() + args.verificationTimeoutMs;
   while (isInteractiveBlock(state.title, state.body, state.url)) {
-    if (Date.now() >= deadline) {
+    if (deadline !== null && Date.now() >= deadline) {
       throw new Error("eBay authentication is required on the capture server. Please contact the site operator.");
     }
     await page.waitForTimeout(2_000);
@@ -367,12 +391,12 @@ function setCors(req, res, allowedOrigins) {
   res.setHeader("vary", "Origin");
 }
 
-async function readJson(req) {
+async function readJson(req, maxBytes = 262_144) {
   const chunks = [];
   let bytes = 0;
   for await (const chunk of req) {
     bytes += chunk.length;
-    if (bytes > 262_144) throw new Error("Request is too large");
+    if (bytes > maxBytes) throw new Error("Request is too large");
     chunks.push(chunk);
   }
   try {
@@ -408,6 +432,81 @@ async function serveStatic(pathname, res) {
   return true;
 }
 
+function batchMetaPath(batchDir, batchId) {
+  return path.join(batchDir, `${batchId}.json`);
+}
+
+function batchProgressPath(batchDir, batchId) {
+  return path.join(batchDir, `${batchId}.ndjson`);
+}
+
+async function writeJsonAtomic(file, value) {
+  await fs.mkdir(path.dirname(file), { recursive: true });
+  const temporary = `${file}.${process.pid}.${crypto.randomUUID()}.tmp`;
+  await fs.writeFile(temporary, JSON.stringify(value), "utf8");
+  await fs.rename(temporary, file);
+}
+
+async function readBatchProgress(batchDir, batchId) {
+  try {
+    const lines = (await fs.readFile(batchProgressPath(batchDir, batchId), "utf8"))
+      .split("\n")
+      .filter(Boolean);
+    return lines.map((line) => JSON.parse(line));
+  } catch (error) {
+    if (error?.code === "ENOENT") return [];
+    throw error;
+  }
+}
+
+async function appendBatchProgress(batchDir, batchId, event) {
+  await fs.appendFile(batchProgressPath(batchDir, batchId), `${JSON.stringify(event)}\n`, "utf8");
+}
+
+async function readBatchMeta(batchDir, batchId) {
+  try {
+    return JSON.parse(await fs.readFile(batchMetaPath(batchDir, batchId), "utf8"));
+  } catch (error) {
+    if (error?.code === "ENOENT") return null;
+    throw error;
+  }
+}
+
+function batchSummary(meta, events, includeItems = true) {
+  const byIndex = new Map(events.map((event) => [event.index, event]));
+  const completed = events.filter((event) => event.status === "complete").length;
+  const failed = events.filter((event) => event.status === "failed").length;
+  const summary = {
+    id: meta.id,
+    status: meta.status,
+    createdAt: meta.createdAt,
+    updatedAt: meta.updatedAt,
+    total: meta.urls.length,
+    completed,
+    failed,
+    remaining: meta.urls.length - completed - failed,
+    pacing: {
+      targetStartIntervalMs: meta.batchStartIntervalMs,
+      minimumSleepAfterCaptureMs: meta.batchMinimumSleepMs
+    },
+    statusUrl: `/api/batches/${meta.id}`
+  };
+  if (meta.pauseReason) summary.pauseReason = meta.pauseReason;
+  if (includeItems) {
+    summary.items = meta.urls.map((url, index) => {
+      const event = byIndex.get(index);
+      return {
+        index,
+        url,
+        status: event?.status || "queued",
+        ...(event?.error ? { error: event.error } : {}),
+        ...(event?.status === "complete" ? { resultUrl: `/api/batches/${meta.id}/results/${index}` } : {})
+      };
+    });
+  }
+  return summary;
+}
+
 export async function runServer(args, { session: injectedSession } = {}) {
   const session = injectedSession || await createCaptureSession(args);
   const persistedRates = await readRateLimitState(args.stateFile);
@@ -421,6 +520,112 @@ export async function runServer(args, { session: injectedSession } = {}) {
   const rateLimitPolicy = `requests ${args.dailyRateLimitMax}/${Math.round(args.dailyRateLimitWindowMs / 1_000)}s; captures ${args.globalRateLimitMax}/${Math.round(args.globalRateLimitWindowMs / 1_000)}s and ${args.captureDailyRateLimitMax}/${Math.round(args.dailyRateLimitWindowMs / 1_000)}s`;
   let captureInFlight = false;
   let nextCaptureAllowedAt = 0;
+  let activeBatch = null;
+  let batchRun = Promise.resolve();
+
+  const persistBatchMeta = async (meta) => {
+    meta.updatedAt = new Date().toISOString();
+    await writeJsonAtomic(batchMetaPath(args.batchDir, meta.id), meta);
+  };
+
+  const processBatch = async (meta) => {
+    activeBatch = meta;
+    meta.status = "processing";
+    delete meta.pauseReason;
+    await persistBatchMeta(meta);
+    const existingEvents = await readBatchProgress(args.batchDir, meta.id);
+    const finishedIndexes = new Set(existingEvents.map((event) => event.index));
+    let nextBatchStartAt = 0;
+
+    for (let index = 0; index < meta.urls.length; index += 1) {
+      if (finishedIndexes.has(index)) continue;
+      const targetUrl = meta.urls[index];
+      const cachedHtml = await cache.get(targetUrl);
+      if (cachedHtml !== null) {
+        await appendBatchProgress(args.batchDir, meta.id, {
+          index,
+          status: "complete",
+          bytes: Buffer.byteLength(cachedHtml),
+          cached: true,
+          completedAt: new Date().toISOString()
+        });
+        continue;
+      }
+
+      const waitMs = Math.max(0, nextBatchStartAt - Date.now());
+      if (waitMs > 0) await new Promise((resolve) => setTimeout(resolve, waitMs));
+
+      let captureRate = captureDailyRateLimiter.consume();
+      if (!captureRate.allowed) {
+        await new Promise((resolve) => setTimeout(resolve, captureRate.retryAfterSeconds * 1_000));
+        captureRate = captureDailyRateLimiter.consume();
+      }
+      await persistRates();
+      if (!captureRate.allowed) throw new Error("Daily capture limiter did not reopen after Retry-After");
+
+      const startedAt = Date.now();
+      captureInFlight = true;
+      try {
+        const html = await session.captureRawHtml(targetUrl);
+        await cache.set(targetUrl, html);
+        await appendBatchProgress(args.batchDir, meta.id, {
+          index,
+          status: "complete",
+          bytes: Buffer.byteLength(html),
+          cached: false,
+          completedAt: new Date().toISOString()
+        });
+      } catch (error) {
+        const message = String(error?.message || error);
+        if (/eBay authentication is required/i.test(message)) {
+          meta.status = "paused";
+          meta.pauseReason = message;
+          await persistBatchMeta(meta);
+          return;
+        }
+        await appendBatchProgress(args.batchDir, meta.id, {
+          index,
+          status: "failed",
+          error: message,
+          completedAt: new Date().toISOString()
+        });
+      } finally {
+        const finishedAt = Date.now();
+        nextBatchStartAt = nextBatchCaptureAt(
+          startedAt,
+          finishedAt,
+          args.batchStartIntervalMs,
+          args.batchMinimumSleepMs
+        );
+        captureInFlight = false;
+      }
+    }
+
+    meta.status = "complete";
+    await persistBatchMeta(meta);
+    activeBatch = null;
+  };
+
+  const startBatch = (meta) => {
+    batchRun = batchRun.then(() => processBatch(meta)).catch(async (error) => {
+      meta.status = "paused";
+      meta.pauseReason = String(error?.message || error);
+      await persistBatchMeta(meta).catch(() => {});
+    });
+    return batchRun;
+  };
+
+  await fs.mkdir(args.batchDir, { recursive: true });
+  const storedBatchFiles = (await fs.readdir(args.batchDir)).filter((name) => name.endsWith(".json"));
+  for (const name of storedBatchFiles.sort()) {
+    const meta = await readBatchMeta(args.batchDir, name.slice(0, -5));
+    if (meta && ["queued", "processing", "paused"].includes(meta.status)) {
+      activeBatch = meta;
+      if (meta.status !== "paused") startBatch(meta);
+      break;
+    }
+  }
+
   const server = http.createServer(async (req, res) => {
     setCors(req, res, args.corsOrigins);
     if (req.method === "OPTIONS") {
@@ -434,6 +639,93 @@ export async function runServer(args, { session: injectedSession } = {}) {
       if (req.method === "GET" && requestUrl.pathname === "/api/health") {
         res.writeHead(200, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
         res.end(JSON.stringify({ ok: true }));
+        return;
+      }
+
+      if (req.method === "POST" && requestUrl.pathname === "/api/batches") {
+        if (activeBatch && ["queued", "processing", "paused"].includes(activeBatch.status)) {
+          res.writeHead(409, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
+          res.end(JSON.stringify({
+            error: "A batch is already active.",
+            batchId: activeBatch.id,
+            statusUrl: `/api/batches/${activeBatch.id}`
+          }));
+          return;
+        }
+        const body = await readJson(req, args.batchRequestMaxBytes);
+        const urls = parseDistinctBatchUrls(body.urls, args.allowHosts, args.batchMaxUrls);
+        const now = new Date().toISOString();
+        const meta = {
+          id: crypto.randomUUID(),
+          status: "queued",
+          createdAt: now,
+          updatedAt: now,
+          urls,
+          batchStartIntervalMs: args.batchStartIntervalMs,
+          batchMinimumSleepMs: args.batchMinimumSleepMs
+        };
+        await persistBatchMeta(meta);
+        activeBatch = meta;
+        startBatch(meta);
+        res.writeHead(202, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
+        res.end(JSON.stringify(batchSummary(meta, [], false)));
+        return;
+      }
+
+      const batchStatusMatch = requestUrl.pathname.match(/^\/api\/batches\/([0-9a-f-]+)$/i);
+      if (req.method === "GET" && batchStatusMatch) {
+        const meta = await readBatchMeta(args.batchDir, batchStatusMatch[1]);
+        if (!meta) {
+          res.writeHead(404, { "content-type": "application/json; charset=utf-8" });
+          res.end(JSON.stringify({ error: "Batch not found" }));
+          return;
+        }
+        const events = await readBatchProgress(args.batchDir, meta.id);
+        res.writeHead(200, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
+        res.end(JSON.stringify(batchSummary(meta, events)));
+        return;
+      }
+
+      const batchResultMatch = requestUrl.pathname.match(/^\/api\/batches\/([0-9a-f-]+)\/results\/(\d+)$/i);
+      if (req.method === "GET" && batchResultMatch) {
+        const meta = await readBatchMeta(args.batchDir, batchResultMatch[1]);
+        const index = Number(batchResultMatch[2]);
+        if (!meta || !Number.isInteger(index) || index < 0 || index >= meta.urls.length) {
+          res.writeHead(404, { "content-type": "text/plain; charset=utf-8" });
+          res.end("Batch result not found");
+          return;
+        }
+        const events = await readBatchProgress(args.batchDir, meta.id);
+        const event = events.find((entry) => entry.index === index && entry.status === "complete");
+        const html = event ? await cache.get(meta.urls[index]) : null;
+        if (html === null) {
+          res.writeHead(404, { "content-type": "text/plain; charset=utf-8", "cache-control": "no-store" });
+          res.end(event ? "Batch result has expired" : "Batch result is not ready");
+          return;
+        }
+        const filename = outputFilename(meta.urls[index]);
+        res.writeHead(200, {
+          "content-type": "text/html; charset=utf-8",
+          "content-disposition": `attachment; filename*=UTF-8''${encodeURIComponent(filename)}`,
+          "cache-control": "no-store",
+          "x-source-url": meta.urls[index],
+          "x-bytes": String(Buffer.byteLength(html))
+        });
+        res.end(html);
+        return;
+      }
+
+      const batchResumeMatch = requestUrl.pathname.match(/^\/api\/batches\/([0-9a-f-]+)\/resume$/i);
+      if (req.method === "POST" && batchResumeMatch) {
+        const meta = await readBatchMeta(args.batchDir, batchResumeMatch[1]);
+        if (!meta || meta.status !== "paused" || activeBatch?.id !== meta.id) {
+          res.writeHead(409, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
+          res.end(JSON.stringify({ error: "Only the currently paused batch can be resumed." }));
+          return;
+        }
+        startBatch(meta);
+        res.writeHead(202, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
+        res.end(JSON.stringify({ id: meta.id, status: "processing", statusUrl: `/api/batches/${meta.id}` }));
         return;
       }
 
@@ -469,6 +761,16 @@ export async function runServer(args, { session: injectedSession } = {}) {
             "x-bytes": String(Buffer.byteLength(cachedHtml))
           });
           res.end(cachedHtml);
+          return;
+        }
+
+        if (activeBatch && ["queued", "processing", "paused"].includes(activeBatch.status)) {
+          res.writeHead(429, {
+            "content-type": "text/plain; charset=utf-8",
+            "cache-control": "no-store",
+            "retry-after": String(Math.ceil(args.batchStartIntervalMs / 1_000))
+          });
+          res.end("A batch is active. Retry after it completes or use the batch status endpoint.");
           return;
         }
 
@@ -529,7 +831,7 @@ export async function runServer(args, { session: injectedSession } = {}) {
     } catch (error) {
       const message = String(error?.message || error);
       const authRequired = /eBay authentication is required/i.test(message);
-      const clientError = /valid URL|not allowed|HTTP|JSON|too large/i.test(message);
+      const clientError = /valid URL|not allowed|HTTP|JSON|too large|Batch request|Batch URLs|cannot exceed/i.test(message);
       res.writeHead(authRequired ? 503 : clientError ? 400 : 500, { "content-type": "text/plain; charset=utf-8", "cache-control": "no-store" });
       res.end(message);
     }
