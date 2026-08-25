@@ -10,6 +10,34 @@ files from `data/quick-grade/testing/ebay-full-html` under `reference/`.
 Every accepted eBay URL is sent to the configured Chromium backend. There are
 no URL-specific downloads or hardcoded search results in the frontend.
 
+## Direct API
+
+The GitHub Pages URL is only the browser interface. Server-side clients should
+send the target eBay URL as JSON to the HTTPS capture API:
+
+```bash
+curl --fail-with-body \
+  --output ebay-sold.html \
+  --request POST \
+  --header 'Content-Type: application/json' \
+  --data '{"url":"https://www.ebay.com/sch/182982/i.html?_from=R40&_dmd=1&_nkw=2026+topps+chrome+disney&LH_Sold=1&_ipg=240"}' \
+  'https://raw-html-maxxing-dd899e.centralus.cloudapp.azure.com/api/fetch'
+```
+
+A successful request returns the rendered HTML directly with HTTP `200` and a
+`Content-Disposition` attachment filename. Clients should honor `Retry-After`
+when the server returns `429`. The deployed single-browser backend accepts one
+capture at a time; parallel requests receive `429` instead of accumulating in
+an unbounded queue.
+
+The deployment currently has aggregate guardrails of 30 captures per hour and
+300 captures per 24-hour window, plus 30 captures per hour for each caller IP.
+These are conservative service controls, not eBay-approved scraping limits.
+They reset when the backend process restarts.
+
+Do not put the eBay URL on the GitHub Pages query string. GitHub Pages is static
+and does not process `?url=...` parameters.
+
 ## Run locally
 
 Requirements: Node.js 22+ and Chrome.

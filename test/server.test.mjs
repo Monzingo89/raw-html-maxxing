@@ -23,16 +23,22 @@ test("creates a safe descriptive HTML filename", () => {
 });
 
 test("environment and CLI options are parsed", () => {
-  const args = parseArgs(["--headless", "--port=9000"], { ALLOW_HOSTS: "ebay.com" });
+  const args = parseArgs(["--headless", "--port=9000"], {
+    ALLOW_HOSTS: "ebay.com",
+    GLOBAL_RATE_LIMIT_MAX: "12",
+    DAILY_RATE_LIMIT_MAX: "100"
+  });
   assert.equal(args.headless, true);
   assert.equal(args.port, 9000);
+  assert.equal(args.globalRateLimitMax, 12);
+  assert.equal(args.dailyRateLimitMax, 100);
   assert.deepEqual(args.allowHosts, ["ebay.com"]);
 });
 
 test("rate limiter resets after its window", () => {
   const limiter = createRateLimiter(2, 1_000);
-  assert.equal(limiter.consume("client", 0).allowed, true);
-  assert.equal(limiter.consume("client", 1).allowed, true);
+  assert.deepEqual(limiter.consume("client", 0), { allowed: true, remaining: 1, retryAfterSeconds: 0 });
+  assert.deepEqual(limiter.consume("client", 1), { allowed: true, remaining: 0, retryAfterSeconds: 0 });
   assert.equal(limiter.consume("client", 2).allowed, false);
   assert.equal(limiter.consume("client", 1_000).allowed, true);
 });

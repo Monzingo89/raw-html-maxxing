@@ -123,6 +123,10 @@ Environment=CORS_ORIGIN=https://monzingo89.github.io
 Environment=ALLOW_HOSTS=ebay.com,www.ebay.com
 Environment=RATE_LIMIT_MAX=30
 Environment=RATE_LIMIT_WINDOW_MS=3600000
+Environment=GLOBAL_RATE_LIMIT_MAX=30
+Environment=GLOBAL_RATE_LIMIT_WINDOW_MS=3600000
+Environment=DAILY_RATE_LIMIT_MAX=300
+Environment=DAILY_RATE_LIMIT_WINDOW_MS=86400000
 Environment=NAV_TIMEOUT_MS=90000
 Environment=SETTLE_MS=1000
 ExecStart=/usr/bin/node /opt/raw-html-maxxing/src/server.mjs

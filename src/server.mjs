@@ -28,6 +28,10 @@ export function parseArgs(argv, env = process.env) {
     verificationTimeoutMs: Number(env.VERIFICATION_TIMEOUT_MS || 60_000),
     rateLimitMax: Number(env.RATE_LIMIT_MAX || 30),
     rateLimitWindowMs: Number(env.RATE_LIMIT_WINDOW_MS || 3_600_000),
+    globalRateLimitMax: Number(env.GLOBAL_RATE_LIMIT_MAX || 30),
+    globalRateLimitWindowMs: Number(env.GLOBAL_RATE_LIMIT_WINDOW_MS || 3_600_000),
+    dailyRateLimitMax: Number(env.DAILY_RATE_LIMIT_MAX || 300),
+    dailyRateLimitWindowMs: Number(env.DAILY_RATE_LIMIT_WINDOW_MS || 86_400_000),
     allowHosts: String(env.ALLOW_HOSTS || "ebay.com,www.ebay.com")
       .split(",")
       .map((value) => value.trim().toLowerCase())
@@ -73,6 +77,10 @@ export function parseArgs(argv, env = process.env) {
   if (!Number.isFinite(args.verificationTimeoutMs) || args.verificationTimeoutMs < 5_000) throw new Error("Verification timeout must be at least 5000ms");
   if (!Number.isInteger(args.rateLimitMax) || args.rateLimitMax < 1) throw new Error("Rate limit must be a positive integer");
   if (!Number.isFinite(args.rateLimitWindowMs) || args.rateLimitWindowMs < 1_000) throw new Error("Rate-limit window must be at least 1000ms");
+  if (!Number.isInteger(args.globalRateLimitMax) || args.globalRateLimitMax < 1) throw new Error("Global rate limit must be a positive integer");
+  if (!Number.isFinite(args.globalRateLimitWindowMs) || args.globalRateLimitWindowMs < 1_000) throw new Error("Global rate-limit window must be at least 1000ms");
+  if (!Number.isInteger(args.dailyRateLimitMax) || args.dailyRateLimitMax < 1) throw new Error("Daily rate limit must be a positive integer");
+  if (!Number.isFinite(args.dailyRateLimitWindowMs) || args.dailyRateLimitWindowMs < 1_000) throw new Error("Daily rate-limit window must be at least 1000ms");
   if (args.allowHosts.length === 0) throw new Error("At least one allowed host is required");
   return args;
 }
@@ -84,16 +92,17 @@ export function createRateLimiter(maxRequests, windowMs) {
       const current = clients.get(key);
       if (!current || now >= current.resetAt) {
         clients.set(key, { count: 1, resetAt: now + windowMs });
-        return { allowed: true, retryAfterSeconds: 0 };
+        return { allowed: true, remaining: maxRequests - 1, retryAfterSeconds: 0 };
       }
       if (current.count >= maxRequests) {
         return {
           allowed: false,
+          remaining: 0,
           retryAfterSeconds: Math.max(1, Math.ceil((current.resetAt - now) / 1_000))
         };
       }
       current.count += 1;
-      return { allowed: true, retryAfterSeconds: 0 };
+      return { allowed: true, remaining: maxRequests - current.count, retryAfterSeconds: 0 };
     }
   };
 }
@@ -226,7 +235,7 @@ function setCors(req, res, allowedOrigins) {
   if (origin) res.setHeader("access-control-allow-origin", origin);
   res.setHeader("access-control-allow-methods", "GET, POST, OPTIONS");
   res.setHeader("access-control-allow-headers", "content-type");
-  res.setHeader("access-control-expose-headers", "content-disposition, x-source-url, x-bytes");
+  res.setHeader("access-control-expose-headers", "content-disposition, retry-after, x-source-url, x-bytes, x-rate-limit-policy");
   res.setHeader("vary", "Origin");
 }
 
@@ -265,7 +274,11 @@ async function serveStatic(pathname, res) {
 
 export async function runServer(args) {
   const session = await createCaptureSession(args);
-  const rateLimiter = createRateLimiter(args.rateLimitMax, args.rateLimitWindowMs);
+  const clientRateLimiter = createRateLimiter(args.rateLimitMax, args.rateLimitWindowMs);
+  const globalRateLimiter = createRateLimiter(args.globalRateLimitMax, args.globalRateLimitWindowMs);
+  const dailyRateLimiter = createRateLimiter(args.dailyRateLimitMax, args.dailyRateLimitWindowMs);
+  const rateLimitPolicy = `${args.globalRateLimitMax}/${Math.round(args.globalRateLimitWindowMs / 1_000)}s; ${args.dailyRateLimitMax}/${Math.round(args.dailyRateLimitWindowMs / 1_000)}s`;
+  let captureInFlight = false;
   const server = http.createServer(async (req, res) => {
     setCors(req, res, args.corsOrigins);
     if (req.method === "OPTIONS") {
@@ -283,22 +296,46 @@ export async function runServer(args) {
       }
 
       if ((req.method === "POST" || req.method === "GET") && requestUrl.pathname === "/api/fetch") {
+        res.setHeader("x-rate-limit-policy", rateLimitPolicy);
         const clientIp = String(req.headers["x-forwarded-for"] || req.socket.remoteAddress || "unknown")
           .split(",")[0]
           .trim();
-        const rate = rateLimiter.consume(clientIp);
-        if (!rate.allowed) {
+        const input = req.method === "POST" ? (await readJson(req)).url : requestUrl.searchParams.get("url");
+        const targetUrl = parseAndValidateTargetUrl(input, args.allowHosts);
+
+        if (captureInFlight) {
           res.writeHead(429, {
             "content-type": "text/plain; charset=utf-8",
             "cache-control": "no-store",
-            "retry-after": String(rate.retryAfterSeconds)
+            "retry-after": "10"
           });
-          res.end("Too many captures. Try again later.");
+          res.end("A capture is already running. Retry after 10 seconds.");
           return;
         }
-        const input = req.method === "POST" ? (await readJson(req)).url : requestUrl.searchParams.get("url");
-        const targetUrl = parseAndValidateTargetUrl(input, args.allowHosts);
-        const html = await session.captureRawHtml(targetUrl);
+
+        const rates = [
+          clientRateLimiter.consume(clientIp),
+          globalRateLimiter.consume("all"),
+          dailyRateLimiter.consume("all")
+        ];
+        const blockedRate = rates.find((rate) => !rate.allowed);
+        if (blockedRate) {
+          res.writeHead(429, {
+            "content-type": "text/plain; charset=utf-8",
+            "cache-control": "no-store",
+            "retry-after": String(blockedRate.retryAfterSeconds)
+          });
+          res.end("Capture rate limit reached. Retry after the indicated delay.");
+          return;
+        }
+
+        captureInFlight = true;
+        let html;
+        try {
+          html = await session.captureRawHtml(targetUrl);
+        } finally {
+          captureInFlight = false;
+        }
         const filename = outputFilename(targetUrl);
         res.writeHead(200, {
           "content-type": "text/html; charset=utf-8",
