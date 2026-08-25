@@ -81,6 +81,19 @@ the persistent browser. A batch only enters the explicit `paused` state when an
 authentication or service error escapes that live waiting loop; resume such a
 batch with `POST /api/batches/{id}/resume` after correcting the issue.
 
+To receive results incrementally, start with `after=-1` and retain the returned
+`nextCursor`:
+
+```bash
+curl --fail-with-body \
+  'https://raw-html-maxxing-dd899e.centralus.cloudapp.azure.com/api/batches/BATCH_ID/results?after=-1&limit=100'
+```
+
+Each response contains only newly finished items after that cursor. Completed
+items have a `resultUrl`; failed items include an error. Use `nextCursor` as the
+next request's `after` value. This lets a sender download HTML continuously as
+it becomes available without resubmitting the original 10,000 URLs.
+
 ## Keep VM screen sharing available
 
 The VM bootstrap runs `x11vnc` with `-forever -shared` under an always-restarting

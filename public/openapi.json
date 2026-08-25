@@ -189,6 +189,26 @@
         }
       }
     },
+    "/api/batches/{batchId}/results": {
+      "get": {
+        "summary": "Get newly finished batch items",
+        "description": "Returns only completed or failed items whose index is greater than the supplied cursor. Begin with after=-1, then pass each response's nextCursor as the next after value.",
+        "operationId": "getIncrementalCaptureBatchResults",
+        "parameters": [
+          { "name": "batchId", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } },
+          { "name": "after", "in": "query", "required": false, "schema": { "type": "integer", "minimum": -1, "default": -1 } },
+          { "name": "limit", "in": "query", "required": false, "schema": { "type": "integer", "minimum": 1, "maximum": 1000, "default": 100 } }
+        ],
+        "responses": {
+          "200": {
+            "description": "Newly finished items and the cursor for the next poll.",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/IncrementalResults" } } }
+          },
+          "400": { "description": "Invalid cursor or page size." },
+          "404": { "description": "Batch not found." }
+        }
+      }
+    },
     "/api/batches/{batchId}/resume": {
       "post": {
         "summary": "Resume a paused batch",
@@ -244,6 +264,31 @@
           "remaining": { "type": "integer" },
           "statusUrl": { "type": "string" },
           "items": { "type": "array", "items": { "type": "object" } }
+        }
+      },
+      "IncrementalResults": {
+        "type": "object",
+        "required": ["batchId", "status", "after", "nextCursor", "hasMore", "items"],
+        "properties": {
+          "batchId": { "type": "string", "format": "uuid" },
+          "status": { "type": "string" },
+          "after": { "type": "integer" },
+          "nextCursor": { "type": "integer" },
+          "hasMore": { "type": "boolean" },
+          "items": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": ["index", "url", "status"],
+              "properties": {
+                "index": { "type": "integer" },
+                "url": { "type": "string", "format": "uri" },
+                "status": { "type": "string", "enum": ["complete", "failed"] },
+                "resultUrl": { "type": "string" },
+                "error": { "type": "string" }
+              }
+            }
+          }
         }
       }
     },

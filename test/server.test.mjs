@@ -186,6 +186,13 @@ test("batch submission returns immediately and exposes completed HTML", async ()
     }
     assert.equal(status.status, "complete");
     assert.equal(status.completed, 1);
+    const feed = await (await fetch(`http://127.0.0.1:${port}/api/batches/${accepted.id}/results?after=-1`)).json();
+    assert.equal(feed.nextCursor, 0);
+    assert.equal(feed.items.length, 1);
+    assert.equal(feed.items[0].resultUrl, status.items[0].resultUrl);
+    const emptyFeed = await (await fetch(`http://127.0.0.1:${port}/api/batches/${accepted.id}/results?after=0`)).json();
+    assert.deepEqual(emptyFeed.items, []);
+    assert.equal(emptyFeed.nextCursor, 0);
     const result = await fetch(`http://127.0.0.1:${port}${status.items[0].resultUrl}`);
     assert.equal(result.status, 200);
     assert.equal(await result.text(), html);

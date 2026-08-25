@@ -686,6 +686,44 @@ export async function runServer(args, { session: injectedSession } = {}) {
         return;
       }
 
+      const batchResultsFeedMatch = requestUrl.pathname.match(/^\/api\/batches\/([0-9a-f-]+)\/results$/i);
+      if (req.method === "GET" && batchResultsFeedMatch) {
+        const meta = await readBatchMeta(args.batchDir, batchResultsFeedMatch[1]);
+        if (!meta) {
+          res.writeHead(404, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
+          res.end(JSON.stringify({ error: "Batch not found" }));
+          return;
+        }
+        const after = Number(requestUrl.searchParams.get("after") ?? -1);
+        const requestedLimit = Number(requestUrl.searchParams.get("limit") ?? 100);
+        if (!Number.isInteger(after) || after < -1 || !Number.isInteger(requestedLimit) || requestedLimit < 1 || requestedLimit > 1_000) {
+          res.writeHead(400, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
+          res.end(JSON.stringify({ error: "after must be an integer of -1 or greater; limit must be between 1 and 1000" }));
+          return;
+        }
+        const events = (await readBatchProgress(args.batchDir, meta.id))
+          .filter((event) => event.index > after)
+          .sort((a, b) => a.index - b.index);
+        const page = events.slice(0, requestedLimit);
+        const items = page.map((event) => ({
+          index: event.index,
+          url: meta.urls[event.index],
+          status: event.status,
+          ...(event.error ? { error: event.error } : {}),
+          ...(event.status === "complete" ? { resultUrl: `/api/batches/${meta.id}/results/${event.index}` } : {})
+        }));
+        res.writeHead(200, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
+        res.end(JSON.stringify({
+          batchId: meta.id,
+          status: meta.status,
+          after,
+          nextCursor: page.length > 0 ? page.at(-1).index : after,
+          hasMore: events.length > page.length,
+          items
+        }));
+        return;
+      }
+
       const batchResultMatch = requestUrl.pathname.match(/^\/api\/batches\/([0-9a-f-]+)\/results\/(\d+)$/i);
       if (req.method === "GET" && batchResultMatch) {
         const meta = await readBatchMeta(args.batchDir, batchResultMatch[1]);
