@@ -166,6 +166,10 @@ ${APP_HOST} {
 }
 CADDY
 
+# Remove the pre-batch rate-limit drop-in used by older deployments. Its
+# Environment entries override the canonical values in the service above.
+rm -f /etc/systemd/system/raw-html-maxxing.service.d/limits.conf
+
 systemctl daemon-reload
 systemctl enable --now raw-html-display.service raw-html-window-manager.service raw-html-vnc.service raw-html-maxxing.service caddy.service
 systemctl restart caddy.service raw-html-maxxing.service
