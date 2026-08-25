@@ -38,7 +38,7 @@
     "/api/fetch": {
       "post": {
         "summary": "Capture rendered HTML",
-        "description": "Accepts one eBay URL and returns the complete rendered DOM as HTML. Do not send parallel requests. On HTTP 429, wait for the number of seconds in Retry-After before retrying. Current service controls are 30 captures per hour per caller IP, 30 captures per hour across all callers, 300 captures per 24-hour window across all callers, and one active capture at a time. These service controls reset when the backend process restarts and are not eBay API quotas.",
+        "description": "Accepts one eBay URL and returns the complete rendered DOM as HTML. Successful HTML is cached by exact URL for 24 hours. Cache hits count toward the API-request allowance but do not revisit eBay or consume the capture allowance. Do not send parallel cache misses. On HTTP 429, wait for the number of seconds in Retry-After before retrying. Current service controls are 1,000 total API requests in any rolling 24 hours; actual browser captures are limited to 30 per hour per caller IP, 30 per hour globally, and 300 in any rolling 24 hours globally, with one active capture at a time. Daily counters persist across backend restarts and are not eBay API quotas.",
         "operationId": "captureRenderedHtml",
         "requestBody": {
           "required": true,
@@ -68,10 +68,14 @@
                 "description": "Response size in bytes.",
                 "schema": { "type": "integer" }
               },
+              "X-Cache": {
+                "description": "HIT when returned from the 24-hour cache; MISS when a browser capture was performed.",
+                "schema": { "type": "string", "enum": ["HIT", "MISS"] }
+              },
               "X-Rate-Limit-Policy": {
                 "description": "Aggregate gateway policy.",
                 "schema": { "type": "string" },
-                "example": "30/3600s; 300/86400s"
+                "example": "requests 1000/86400s; captures 30/3600s and 300/86400s"
               }
             },
             "content": {

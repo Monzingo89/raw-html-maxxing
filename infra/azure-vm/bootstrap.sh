@@ -125,8 +125,14 @@ Environment=RATE_LIMIT_MAX=30
 Environment=RATE_LIMIT_WINDOW_MS=3600000
 Environment=GLOBAL_RATE_LIMIT_MAX=30
 Environment=GLOBAL_RATE_LIMIT_WINDOW_MS=3600000
-Environment=DAILY_RATE_LIMIT_MAX=300
+Environment=DAILY_RATE_LIMIT_MAX=1000
 Environment=DAILY_RATE_LIMIT_WINDOW_MS=86400000
+Environment=CAPTURE_DAILY_RATE_LIMIT_MAX=300
+Environment=RATE_LIMIT_STATE_FILE=/var/lib/raw-html-maxxing/rate-limit-state.json
+Environment=CACHE_DIR=/var/lib/raw-html-maxxing/capture-cache
+Environment=CACHE_TTL_MS=86400000
+Environment=CAPTURE_DELAY_MIN_MS=1000
+Environment=CAPTURE_DELAY_MAX_MS=3000
 Environment=NAV_TIMEOUT_MS=90000
 Environment=SETTLE_MS=1000
 ExecStart=/usr/bin/node /opt/raw-html-maxxing/src/server.mjs

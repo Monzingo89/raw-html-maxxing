@@ -38,10 +38,13 @@ when the server returns `429`. The deployed single-browser backend accepts one
 capture at a time; parallel requests receive `429` instead of accumulating in
 an unbounded queue.
 
-The deployment currently has aggregate guardrails of 30 captures per hour and
-300 captures per 24-hour window, plus 30 captures per hour for each caller IP.
-These are conservative service controls, not eBay-approved scraping limits.
-They reset when the backend process restarts.
+The deployment accepts at most 1,000 API requests in any rolling 24-hour period.
+Successful HTML is cached by exact URL for 24 hours, and cache hits do not
+revisit eBay. Actual browser captures remain limited to 30 per hour globally,
+300 in any rolling 24 hours, and 30 per hour for each caller IP. Uncached
+captures are serialized and separated by a random 1–3 second delay. The rolling
+daily counters and cache persist across backend restarts. These are conservative
+service controls, not eBay-approved scraping limits.
 
 Do not put the eBay URL on the GitHub Pages query string. GitHub Pages is static
 and does not process `?url=...` parameters.

@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import http from "node:http";
+import crypto from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -31,8 +32,14 @@ export function parseArgs(argv, env = process.env) {
     rateLimitWindowMs: Number(env.RATE_LIMIT_WINDOW_MS || 3_600_000),
     globalRateLimitMax: Number(env.GLOBAL_RATE_LIMIT_MAX || 30),
     globalRateLimitWindowMs: Number(env.GLOBAL_RATE_LIMIT_WINDOW_MS || 3_600_000),
-    dailyRateLimitMax: Number(env.DAILY_RATE_LIMIT_MAX || 300),
+    dailyRateLimitMax: Number(env.DAILY_RATE_LIMIT_MAX || 1_000),
     dailyRateLimitWindowMs: Number(env.DAILY_RATE_LIMIT_WINDOW_MS || 86_400_000),
+    captureDailyRateLimitMax: Number(env.CAPTURE_DAILY_RATE_LIMIT_MAX || 300),
+    stateFile: path.resolve(env.RATE_LIMIT_STATE_FILE || path.join(rootDir, ".tmp/rate-limit-state.json")),
+    cacheDir: path.resolve(env.CACHE_DIR || path.join(rootDir, ".tmp/capture-cache")),
+    cacheTtlMs: Number(env.CACHE_TTL_MS || 86_400_000),
+    captureDelayMinMs: Number(env.CAPTURE_DELAY_MIN_MS || 1_000),
+    captureDelayMaxMs: Number(env.CAPTURE_DELAY_MAX_MS || 3_000),
     allowHosts: String(env.ALLOW_HOSTS || "ebay.com,www.ebay.com")
       .split(",")
       .map((value) => value.trim().toLowerCase())
@@ -82,8 +89,128 @@ export function parseArgs(argv, env = process.env) {
   if (!Number.isFinite(args.globalRateLimitWindowMs) || args.globalRateLimitWindowMs < 1_000) throw new Error("Global rate-limit window must be at least 1000ms");
   if (!Number.isInteger(args.dailyRateLimitMax) || args.dailyRateLimitMax < 1) throw new Error("Daily rate limit must be a positive integer");
   if (!Number.isFinite(args.dailyRateLimitWindowMs) || args.dailyRateLimitWindowMs < 1_000) throw new Error("Daily rate-limit window must be at least 1000ms");
+  if (!Number.isInteger(args.captureDailyRateLimitMax) || args.captureDailyRateLimitMax < 1) throw new Error("Daily capture limit must be a positive integer");
+  if (!Number.isFinite(args.cacheTtlMs) || args.cacheTtlMs < 1_000) throw new Error("Cache TTL must be at least 1000ms");
+  if (!Number.isFinite(args.captureDelayMinMs) || args.captureDelayMinMs < 0) throw new Error("Minimum capture delay cannot be negative");
+  if (!Number.isFinite(args.captureDelayMaxMs) || args.captureDelayMaxMs < args.captureDelayMinMs) throw new Error("Maximum capture delay must be at least the minimum");
   if (args.allowHosts.length === 0) throw new Error("At least one allowed host is required");
   return args;
+}
+
+export function createRollingRateLimiter(maxRequests, windowMs, initialEvents = []) {
+  let events = initialEvents.filter((timestamp) => Number.isFinite(timestamp)).sort((a, b) => a - b);
+  const prune = (now) => {
+    const cutoff = now - windowMs;
+    let firstCurrent = 0;
+    while (firstCurrent < events.length && events[firstCurrent] <= cutoff) firstCurrent += 1;
+    if (firstCurrent > 0) events = events.slice(firstCurrent);
+  };
+  return {
+    consume(now = Date.now()) {
+      prune(now);
+      if (events.length >= maxRequests) {
+        return {
+          allowed: false,
+          remaining: 0,
+          retryAfterSeconds: Math.max(1, Math.ceil((events[0] + windowMs - now) / 1_000))
+        };
+      }
+      events.push(now);
+      return { allowed: true, remaining: maxRequests - events.length, retryAfterSeconds: 0 };
+    },
+    snapshot(now = Date.now()) {
+      prune(now);
+      return [...events];
+    }
+  };
+}
+
+export function randomDelayMs(minMs, maxMs, random = Math.random) {
+  return Math.floor(minMs + random() * (maxMs - minMs + 1));
+}
+
+function cachePath(cacheDir, targetUrl) {
+  const key = crypto.createHash("sha256").update(targetUrl).digest("hex");
+  return path.join(cacheDir, `${key}.html`);
+}
+
+export function createHtmlCache(cacheDir, ttlMs) {
+  let lastPruneAt = 0;
+  const prune = async (now = Date.now()) => {
+    let entries;
+    try {
+      entries = await fs.readdir(cacheDir, { withFileTypes: true });
+    } catch (error) {
+      if (error?.code === "ENOENT") return 0;
+      throw error;
+    }
+    let removed = 0;
+    await Promise.all(entries.filter((entry) => entry.isFile() && entry.name.endsWith(".html")).map(async (entry) => {
+      const file = path.join(cacheDir, entry.name);
+      const stat = await fs.stat(file).catch(() => null);
+      if (stat && now - stat.mtimeMs > ttlMs) {
+        await fs.unlink(file).catch(() => {});
+        removed += 1;
+      }
+    }));
+    lastPruneAt = now;
+    return removed;
+  };
+  return {
+    async get(targetUrl, now = Date.now()) {
+      const file = cachePath(cacheDir, targetUrl);
+      try {
+        const stat = await fs.stat(file);
+        if (now - stat.mtimeMs > ttlMs) {
+          await fs.unlink(file).catch(() => {});
+          return null;
+        }
+        return await fs.readFile(file, "utf8");
+      } catch (error) {
+        if (error?.code === "ENOENT") return null;
+        throw error;
+      }
+    },
+    async set(targetUrl, html) {
+      await fs.mkdir(cacheDir, { recursive: true });
+      if (Date.now() - lastPruneAt >= 3_600_000) await prune();
+      const file = cachePath(cacheDir, targetUrl);
+      const temporary = `${file}.${process.pid}.${crypto.randomUUID()}.tmp`;
+      await fs.writeFile(temporary, html, "utf8");
+      await fs.rename(temporary, file);
+    },
+    prune
+  };
+}
+
+async function readRateLimitState(stateFile) {
+  try {
+    const parsed = JSON.parse(await fs.readFile(stateFile, "utf8"));
+    return {
+      requests: Array.isArray(parsed.requests) ? parsed.requests : [],
+      captures: Array.isArray(parsed.captures) ? parsed.captures : []
+    };
+  } catch (error) {
+    if (error?.code === "ENOENT") return { requests: [], captures: [] };
+    throw new Error(`Cannot read rate-limit state: ${error?.message || error}`);
+  }
+}
+
+function createRateLimitStateWriter(stateFile, requestLimiter, captureLimiter) {
+  let writeQueue = Promise.resolve();
+  return () => {
+    writeQueue = writeQueue.then(async () => {
+      await fs.mkdir(path.dirname(stateFile), { recursive: true });
+      const temporary = `${stateFile}.${process.pid}.tmp`;
+      const state = JSON.stringify({
+        requests: requestLimiter.snapshot(),
+        captures: captureLimiter.snapshot()
+      });
+      await fs.writeFile(temporary, state, "utf8");
+      await fs.rename(temporary, stateFile);
+    });
+    return writeQueue;
+  };
 }
 
 export function createRateLimiter(maxRequests, windowMs) {
@@ -236,7 +363,7 @@ function setCors(req, res, allowedOrigins) {
   if (origin) res.setHeader("access-control-allow-origin", origin);
   res.setHeader("access-control-allow-methods", "GET, POST, OPTIONS");
   res.setHeader("access-control-allow-headers", "content-type");
-  res.setHeader("access-control-expose-headers", "content-disposition, retry-after, x-source-url, x-bytes, x-rate-limit-policy");
+  res.setHeader("access-control-expose-headers", "content-disposition, retry-after, x-source-url, x-bytes, x-cache, x-rate-limit-policy");
   res.setHeader("vary", "Origin");
 }
 
@@ -281,13 +408,19 @@ async function serveStatic(pathname, res) {
   return true;
 }
 
-export async function runServer(args) {
-  const session = await createCaptureSession(args);
+export async function runServer(args, { session: injectedSession } = {}) {
+  const session = injectedSession || await createCaptureSession(args);
+  const persistedRates = await readRateLimitState(args.stateFile);
   const clientRateLimiter = createRateLimiter(args.rateLimitMax, args.rateLimitWindowMs);
   const globalRateLimiter = createRateLimiter(args.globalRateLimitMax, args.globalRateLimitWindowMs);
-  const dailyRateLimiter = createRateLimiter(args.dailyRateLimitMax, args.dailyRateLimitWindowMs);
-  const rateLimitPolicy = `${args.globalRateLimitMax}/${Math.round(args.globalRateLimitWindowMs / 1_000)}s; ${args.dailyRateLimitMax}/${Math.round(args.dailyRateLimitWindowMs / 1_000)}s`;
+  const requestDailyRateLimiter = createRollingRateLimiter(args.dailyRateLimitMax, args.dailyRateLimitWindowMs, persistedRates.requests);
+  const captureDailyRateLimiter = createRollingRateLimiter(args.captureDailyRateLimitMax, args.dailyRateLimitWindowMs, persistedRates.captures);
+  const persistRates = createRateLimitStateWriter(args.stateFile, requestDailyRateLimiter, captureDailyRateLimiter);
+  const cache = createHtmlCache(args.cacheDir, args.cacheTtlMs);
+  await cache.prune();
+  const rateLimitPolicy = `requests ${args.dailyRateLimitMax}/${Math.round(args.dailyRateLimitWindowMs / 1_000)}s; captures ${args.globalRateLimitMax}/${Math.round(args.globalRateLimitWindowMs / 1_000)}s and ${args.captureDailyRateLimitMax}/${Math.round(args.dailyRateLimitWindowMs / 1_000)}s`;
   let captureInFlight = false;
+  let nextCaptureAllowedAt = 0;
   const server = http.createServer(async (req, res) => {
     setCors(req, res, args.corsOrigins);
     if (req.method === "OPTIONS") {
@@ -312,6 +445,33 @@ export async function runServer(args) {
         const input = req.method === "POST" ? (await readJson(req)).url : requestUrl.searchParams.get("url");
         const targetUrl = parseAndValidateTargetUrl(input, args.allowHosts);
 
+        const requestRate = requestDailyRateLimiter.consume();
+        await persistRates();
+        if (!requestRate.allowed) {
+          res.writeHead(429, {
+            "content-type": "text/plain; charset=utf-8",
+            "cache-control": "no-store",
+            "retry-after": String(requestRate.retryAfterSeconds)
+          });
+          res.end("Daily API request limit reached. Retry after the indicated delay.");
+          return;
+        }
+
+        const cachedHtml = await cache.get(targetUrl);
+        if (cachedHtml !== null) {
+          const filename = outputFilename(targetUrl);
+          res.writeHead(200, {
+            "content-type": "text/html; charset=utf-8",
+            "content-disposition": `attachment; filename*=UTF-8''${encodeURIComponent(filename)}`,
+            "cache-control": "no-store",
+            "x-cache": "HIT",
+            "x-source-url": targetUrl,
+            "x-bytes": String(Buffer.byteLength(cachedHtml))
+          });
+          res.end(cachedHtml);
+          return;
+        }
+
         if (captureInFlight) {
           res.writeHead(429, {
             "content-type": "text/plain; charset=utf-8",
@@ -325,8 +485,9 @@ export async function runServer(args) {
         const rates = [
           clientRateLimiter.consume(clientIp),
           globalRateLimiter.consume("all"),
-          dailyRateLimiter.consume("all")
+          captureDailyRateLimiter.consume()
         ];
+        await persistRates();
         const blockedRate = rates.find((rate) => !rate.allowed);
         if (blockedRate) {
           res.writeHead(429, {
@@ -341,8 +502,12 @@ export async function runServer(args) {
         captureInFlight = true;
         let html;
         try {
+          const waitMs = Math.max(0, nextCaptureAllowedAt - Date.now());
+          if (waitMs > 0) await new Promise((resolve) => setTimeout(resolve, waitMs));
           html = await session.captureRawHtml(targetUrl);
+          await cache.set(targetUrl, html);
         } finally {
+          nextCaptureAllowedAt = Date.now() + randomDelayMs(args.captureDelayMinMs, args.captureDelayMaxMs);
           captureInFlight = false;
         }
         const filename = outputFilename(targetUrl);
@@ -350,6 +515,7 @@ export async function runServer(args) {
           "content-type": "text/html; charset=utf-8",
           "content-disposition": `attachment; filename*=UTF-8''${encodeURIComponent(filename)}`,
           "cache-control": "no-store",
+          "x-cache": "MISS",
           "x-source-url": targetUrl,
           "x-bytes": String(Buffer.byteLength(html))
         });
