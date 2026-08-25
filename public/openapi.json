@@ -192,16 +192,16 @@
     "/api/batches/{batchId}/results": {
       "get": {
         "summary": "Get newly finished batch items",
-        "description": "Returns only completed or failed items whose index is greater than the supplied cursor. Begin with after=-1, then pass each response's nextCursor as the next after value.",
+        "description": "Returns completed HTML itself, or failure details, for items whose index is greater than the supplied cursor. Begin with after=-1, then pass each response's nextCursor as the next after value. Responses are intentionally limited to 10 items because rendered HTML can be large.",
         "operationId": "getIncrementalCaptureBatchResults",
         "parameters": [
           { "name": "batchId", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } },
           { "name": "after", "in": "query", "required": false, "schema": { "type": "integer", "minimum": -1, "default": -1 } },
-          { "name": "limit", "in": "query", "required": false, "schema": { "type": "integer", "minimum": 1, "maximum": 1000, "default": 100 } }
+          { "name": "limit", "in": "query", "required": false, "schema": { "type": "integer", "minimum": 1, "maximum": 10, "default": 1 } }
         ],
         "responses": {
           "200": {
-            "description": "Newly finished items and the cursor for the next poll.",
+            "description": "Newly finished items, complete rendered HTML, and the cursor for the next poll.",
             "content": { "application/json": { "schema": { "$ref": "#/components/schemas/IncrementalResults" } } }
           },
           "400": { "description": "Invalid cursor or page size." },
@@ -284,7 +284,7 @@
                 "index": { "type": "integer" },
                 "url": { "type": "string", "format": "uri" },
                 "status": { "type": "string", "enum": ["complete", "failed"] },
-                "resultUrl": { "type": "string" },
+                "html": { "type": "string", "description": "Complete rendered HTML when status is complete." },
                 "error": { "type": "string" }
               }
             }

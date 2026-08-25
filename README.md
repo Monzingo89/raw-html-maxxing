@@ -86,13 +86,15 @@ To receive results incrementally, start with `after=-1` and retain the returned
 
 ```bash
 curl --fail-with-body \
-  'https://raw-html-maxxing-dd899e.centralus.cloudapp.azure.com/api/batches/BATCH_ID/results?after=-1&limit=100'
+  'https://raw-html-maxxing-dd899e.centralus.cloudapp.azure.com/api/batches/BATCH_ID/results?after=-1&limit=1'
 ```
 
 Each response contains only newly finished items after that cursor. Completed
-items have a `resultUrl`; failed items include an error. Use `nextCursor` as the
-next request's `after` value. This lets a sender download HTML continuously as
-it becomes available without resubmitting the original 10,000 URLs.
+items contain the complete rendered HTML in an `html` field; failed items include
+an error. Use `nextCursor` as the next request's `after` value. Because rendered
+HTML can be large, the endpoint defaults to one item and permits at most 10 per
+response. This lets a sender receive HTML continuously as it becomes available
+without resubmitting the original 10,000 URLs.
 
 ## Keep VM screen sharing available
 

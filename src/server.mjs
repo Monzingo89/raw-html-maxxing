@@ -695,22 +695,29 @@ export async function runServer(args, { session: injectedSession } = {}) {
           return;
         }
         const after = Number(requestUrl.searchParams.get("after") ?? -1);
-        const requestedLimit = Number(requestUrl.searchParams.get("limit") ?? 100);
-        if (!Number.isInteger(after) || after < -1 || !Number.isInteger(requestedLimit) || requestedLimit < 1 || requestedLimit > 1_000) {
+        const requestedLimit = Number(requestUrl.searchParams.get("limit") ?? 1);
+        if (!Number.isInteger(after) || after < -1 || !Number.isInteger(requestedLimit) || requestedLimit < 1 || requestedLimit > 10) {
           res.writeHead(400, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
-          res.end(JSON.stringify({ error: "after must be an integer of -1 or greater; limit must be between 1 and 1000" }));
+          res.end(JSON.stringify({ error: "after must be an integer of -1 or greater; limit must be between 1 and 10" }));
           return;
         }
         const events = (await readBatchProgress(args.batchDir, meta.id))
           .filter((event) => event.index > after)
           .sort((a, b) => a.index - b.index);
         const page = events.slice(0, requestedLimit);
-        const items = page.map((event) => ({
-          index: event.index,
-          url: meta.urls[event.index],
-          status: event.status,
-          ...(event.error ? { error: event.error } : {}),
-          ...(event.status === "complete" ? { resultUrl: `/api/batches/${meta.id}/results/${event.index}` } : {})
+        const items = await Promise.all(page.map(async (event) => {
+          const url = meta.urls[event.index];
+          const html = event.status === "complete" ? await cache.get(url) : null;
+          if (event.status === "complete" && html === null) {
+            return { index: event.index, url, status: "failed", error: "Completed HTML has expired from result storage" };
+          }
+          return {
+            index: event.index,
+            url,
+            status: event.status,
+            ...(event.error ? { error: event.error } : {}),
+            ...(event.status === "complete" ? { html } : {})
+          };
         }));
         res.writeHead(200, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
         res.end(JSON.stringify({
