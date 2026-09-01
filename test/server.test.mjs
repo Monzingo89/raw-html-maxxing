@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { createHtmlCache, createRateLimiter, createRollingRateLimiter, isInteractiveBlock, minimumCaptureLength, nextBatchCaptureAt, outputFilename, parseAndValidateTargetUrl, parseArgs, parseDistinctBatchUrls, randomDelayMs, runServer } from "../src/server.mjs";
+import { bearerTokenMatches, createHtmlCache, createRateLimiter, createRollingRateLimiter, htmlCacheStats, isAuthenticationFailure, isInteractiveBlock, latestBatchEvents, minimumCaptureLength, nextBatchCaptureAt, normalizeFailure, outputFilename, parseAndValidateTargetUrl, parseArgs, parseDistinctBatchUrls, randomDelayMs, retryDelayMs, runServer } from "../src/server.mjs";
 
 test("accepts eBay and its subdomains", () => {
   assert.equal(
@@ -40,15 +40,37 @@ test("environment and CLI options are parsed", () => {
     ALLOW_HOSTS: "ebay.com",
     GLOBAL_RATE_LIMIT_MAX: "12",
     DAILY_RATE_LIMIT_MAX: "1000",
-    CAPTURE_DAILY_RATE_LIMIT_MAX: "300"
+    CAPTURE_DAILY_RATE_LIMIT_MAX: "300",
+    LOGIN_RETRY_DELAY_MS: "180000",
+    ADMIN_STATUS_TOKEN: "admin-test-token"
   });
   assert.equal(args.headless, true);
   assert.equal(args.port, 9000);
   assert.equal(args.globalRateLimitMax, 12);
   assert.equal(args.dailyRateLimitMax, 1000);
   assert.equal(args.captureDailyRateLimitMax, 300);
+  assert.equal(args.loginRetryDelayMs, 180_000);
   assert.equal(args.verificationTimeoutMs, 0);
+  assert.equal(args.adminStatusToken, "admin-test-token");
   assert.deepEqual(args.allowHosts, ["ebay.com"]);
+});
+
+test("admin bearer tokens use exact constant-time matching", () => {
+  assert.equal(bearerTokenMatches("Bearer admin-test-token", "admin-test-token"), true);
+  assert.equal(bearerTokenMatches("Bearer wrong", "admin-test-token"), false);
+  assert.equal(bearerTokenMatches("", "admin-test-token"), false);
+  assert.equal(bearerTokenMatches("Bearer anything", ""), false);
+});
+
+test("HTML cache stats count only HTML files and bytes", async () => {
+  const cacheDir = await fs.mkdtemp(path.join(os.tmpdir(), "raw-html-cache-stats-test-"));
+  try {
+    await fs.writeFile(path.join(cacheDir, "one.html"), "1234");
+    await fs.writeFile(path.join(cacheDir, "ignore.json"), "123456");
+    assert.deepEqual(await htmlCacheStats(cacheDir), { files: 1, bytes: 4 });
+  } finally {
+    await fs.rm(cacheDir, { recursive: true, force: true });
+  }
 });
 
 test("rolling limiter retains only events within the trailing window", () => {
@@ -91,6 +113,20 @@ test("batch pacing fills an 8.64-second slot and always sleeps at least 4.64 sec
   assert.equal(nextBatchCaptureAt(0, 3_000, 8_640, 4_640), 8_640);
   assert.equal(nextBatchCaptureAt(0, 4_000, 8_640, 4_640), 8_640);
   assert.equal(nextBatchCaptureAt(0, 5_000, 8_640, 4_640), 9_640);
+});
+
+test("retry helpers group variable errors and retain only the latest item event", () => {
+  assert.equal(normalizeFailure("Timeout 90000 at https://www.ebay.com/item/123456"), "Timeout <n> at <url>");
+  assert.equal(retryDelayMs(1, 1_000, 10_000), 1_000);
+  assert.equal(retryDelayMs(9, 1_000, 10_000), 10_000);
+  assert.deepEqual(latestBatchEvents([
+    { index: 1, status: "retrying", attempt: 1 },
+    { index: 0, status: "complete" },
+    { index: 1, status: "complete", attempt: 2 }
+  ]), [
+    { index: 0, status: "complete" },
+    { index: 1, status: "complete", attempt: 2 }
+  ]);
 });
 
 test("POST returns HTML and caches an identical URL for 24 hours", async () => {
@@ -145,6 +181,45 @@ test("POST returns HTML and caches an identical URL for 24 hours", async () => {
       body: JSON.stringify({ url: "https://www.ebay.com/sch/i.html?_nkw=charizard" })
     });
     assert.equal(blockedDistinct.status, 429);
+  } finally {
+    await new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+    await fs.rm(temporaryDir, { recursive: true, force: true });
+  }
+});
+
+test("admin status is private and returns operational data without cookie values", async () => {
+  const temporaryDir = await fs.mkdtemp(path.join(os.tmpdir(), "raw-html-admin-status-test-"));
+  const session = {
+    async captureRawHtml() { return "<!DOCTYPE html><html>captured</html>"; },
+    async getSessionStatus() { return { persistentProfile: true, cookieCount: 7 }; },
+    async close() {}
+  };
+  const args = parseArgs([], {
+    HOST: "127.0.0.1",
+    PORT: "8787",
+    ALLOW_HOSTS: "ebay.com",
+    ADMIN_STATUS_TOKEN: "admin-test-token",
+    INSTANCE_NAME: "test-vm",
+    CACHE_DIR: path.join(temporaryDir, "cache"),
+    RATE_LIMIT_STATE_FILE: path.join(temporaryDir, "rates.json"),
+    BATCH_DIR: path.join(temporaryDir, "batches"),
+    RETRY_QUEUE_FILE: path.join(temporaryDir, "retry.json")
+  });
+  args.port = 0;
+  const server = await runServer(args, { session });
+  const port = server.address().port;
+  try {
+    assert.equal((await fetch(`http://127.0.0.1:${port}/api/admin/status`)).status, 401);
+    const response = await fetch(`http://127.0.0.1:${port}/api/admin/status`, {
+      headers: { authorization: "Bearer admin-test-token" }
+    });
+    assert.equal(response.status, 200);
+    const body = await response.json();
+    assert.equal(body.instanceName, "test-vm");
+    assert.equal(body.html.files, 0);
+    assert.deepEqual(body.usage.requests, { used: 0, limit: 10_000 });
+    assert.equal(body.browserSession.cookieCount, 7);
+    assert.equal(JSON.stringify(body).includes("cookieValue"), false);
   } finally {
     await new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
     await fs.rm(temporaryDir, { recursive: true, force: true });
@@ -210,6 +285,133 @@ test("batch submission returns immediately and exposes completed HTML", async ()
   }
 });
 
+test("failed direct captures return 503 and persist an automatic retry", async () => {
+  const temporaryDir = await fs.mkdtemp(path.join(os.tmpdir(), "raw-html-retry-test-"));
+  const retryQueueFile = path.join(temporaryDir, "retry-queue.json");
+  const session = {
+    async captureRawHtml() { throw new Error("upstream temporarily unavailable 503"); },
+    async close() {}
+  };
+  const args = parseArgs([], {
+    HOST: "127.0.0.1",
+    PORT: "8787",
+    ALLOW_HOSTS: "ebay.com",
+    CACHE_DIR: path.join(temporaryDir, "cache"),
+    RATE_LIMIT_STATE_FILE: path.join(temporaryDir, "rates.json"),
+    RETRY_QUEUE_FILE: retryQueueFile,
+    RETRY_BASE_DELAY_MS: "60000",
+    RETRY_MAX_DELAY_MS: "60000",
+    CAPTURE_DELAY_MIN_MS: "0",
+    CAPTURE_DELAY_MAX_MS: "0",
+    ALERT_STATE_FILE: path.join(temporaryDir, "alerts.json")
+  });
+  args.port = 0;
+  const server = await runServer(args, { session });
+  const port = server.address().port;
+  try {
+    const response = await fetch(`http://127.0.0.1:${port}/api/fetch`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ url: "https://www.ebay.com/sch/i.html?_nkw=retry-test" })
+    });
+    assert.equal(response.status, 503);
+    assert.ok(response.headers.get("x-retry-id"));
+    const body = await response.json();
+    assert.equal(body.error, "Capture temporarily unavailable; queued for automatic retry.");
+    const queue = JSON.parse(await fs.readFile(retryQueueFile, "utf8"));
+    assert.equal(queue.length, 1);
+    assert.equal(queue[0].attempts, 1);
+    for (const keyword of ["retry-test-two", "retry-test-three"]) {
+      const grouped = await fetch(`http://127.0.0.1:${port}/api/fetch`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ url: `https://www.ebay.com/sch/i.html?_nkw=${keyword}` })
+      });
+      assert.equal(grouped.status, 503);
+    }
+    const groupedQueue = JSON.parse(await fs.readFile(retryQueueFile, "utf8"));
+    assert.equal(groupedQueue.length, 3);
+    const outbox = await fs.readFile(`${args.alertStateFile}.outbox.ndjson`, "utf8");
+    assert.match(outbox, /grouped-direct-fetch-failures/);
+  } finally {
+    await new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+    await fs.rm(temporaryDir, { recursive: true, force: true });
+  }
+});
+
+test("login loss pauses for three minutes, accepts incoming work, and resumes it in order", async () => {
+  const temporaryDir = await fs.mkdtemp(path.join(os.tmpdir(), "raw-html-login-pause-test-"));
+  const attemptedUrls = [];
+  let firstAttempt = true;
+  const session = {
+    async captureRawHtml(url) {
+      attemptedUrls.push(url);
+      if (firstAttempt) {
+        firstAttempt = false;
+        throw new Error("eBay authentication is required on the capture server. Complete verification through Screen Sharing.");
+      }
+      return `<!DOCTYPE html><html><body>${url}</body></html>`;
+    },
+    async close() {}
+  };
+  const args = parseArgs([], {
+    HOST: "127.0.0.1",
+    PORT: "8787",
+    ALLOW_HOSTS: "ebay.com",
+    RATE_LIMIT_MAX: "30",
+    GLOBAL_RATE_LIMIT_MAX: "30",
+    DAILY_RATE_LIMIT_MAX: "30",
+    CAPTURE_DAILY_RATE_LIMIT_MAX: "30",
+    CACHE_DIR: path.join(temporaryDir, "cache"),
+    RATE_LIMIT_STATE_FILE: path.join(temporaryDir, "rates.json"),
+    RETRY_QUEUE_FILE: path.join(temporaryDir, "retry.json"),
+    LOGIN_STATE_FILE: path.join(temporaryDir, "login.json"),
+    ALERT_STATE_FILE: path.join(temporaryDir, "alerts.json"),
+    LOGIN_RETRY_DELAY_MS: "1000",
+    RETRY_BASE_DELAY_MS: "1000",
+    RETRY_MAX_DELAY_MS: "1000",
+    CAPTURE_DELAY_MIN_MS: "0",
+    CAPTURE_DELAY_MAX_MS: "0"
+  });
+  args.port = 0;
+  const server = await runServer(args, { session });
+  const port = server.address().port;
+  const urls = [
+    "https://www.ebay.com/sch/i.html?_nkw=login-pause-one",
+    "https://www.ebay.com/sch/i.html?_nkw=login-pause-two"
+  ];
+  const request = (url) => fetch(`http://127.0.0.1:${port}/api/fetch`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ url })
+  });
+  try {
+    const stopped = await request(urls[0]);
+    assert.equal(stopped.status, 202);
+    assert.equal((await stopped.json()).message, "Please Wait, Logging In");
+
+    const acceptedWhilePaused = await request(urls[1]);
+    assert.equal(acceptedWhilePaused.status, 202);
+    assert.equal((await acceptedWhilePaused.json()).status, "waiting_for_login");
+    assert.equal(attemptedUrls.length, 1);
+
+    let resumed;
+    for (let attempt = 0; attempt < 40; attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      resumed = await request(urls[1]);
+      if (resumed.status === 200) break;
+    }
+    assert.equal(resumed.status, 200);
+    assert.equal(resumed.headers.get("x-cache"), "HIT");
+    assert.deepEqual(attemptedUrls, [urls[0], urls[0], urls[1]]);
+    const loginState = JSON.parse(await fs.readFile(args.loginStateFile, "utf8"));
+    assert.equal(loginState.active, false);
+  } finally {
+    await new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+    await fs.rm(temporaryDir, { recursive: true, force: true });
+  }
+});
+
 test("rate limiter resets after its window", () => {
   const limiter = createRateLimiter(2, 1_000);
   assert.deepEqual(limiter.consume("client", 0), { allowed: true, remaining: 1, retryAfterSeconds: 0 });
@@ -221,6 +423,12 @@ test("rate limiter resets after its window", () => {
 test("recognizes eBay sign-in and verification pages", () => {
   assert.equal(isInteractiveBlock("Sign in or Register | eBay", "", "https://signin.ebay.com/ws/eBayISAPI.dll"), true);
   assert.equal(isInteractiveBlock("Pikachu VMAX Promo for sale | eBay", "Results", "https://www.ebay.com/sch/i.html"), false);
+});
+
+test("distinguishes authentication loss from infrastructure failures", () => {
+  assert.equal(isAuthenticationFailure(new Error("eBay authentication is required on the capture server")), true);
+  assert.equal(isAuthenticationFailure(new Error("page.goto: Target page, context or browser has been closed")), false);
+  assert.equal(isAuthenticationFailure(new Error("ENOSPC: no space left on device")), false);
 });
 
 test("requires a fully hydrated DOM for eBay search captures", () => {

@@ -4,7 +4,7 @@ set -euo pipefail
 APP_DIR=/opt/raw-html-maxxing
 APP_USER=rawhtml
 APP_HOME=/var/lib/raw-html-maxxing
-APP_HOST=raw-html-maxxing-dd899e.centralus.cloudapp.azure.com
+APP_HOST=${APP_HOST:-raw-html-maxxing-dd899e.centralus.cloudapp.azure.com}
 REPO_URL=https://github.com/Monzingo89/raw-html-maxxing.git
 
 export DEBIAN_FRONTEND=noninteractive
@@ -142,12 +142,28 @@ Environment=BATCH_MAX_URLS=10000
 Environment=BATCH_REQUEST_MAX_BYTES=33554432
 Environment=BATCH_START_INTERVAL_MS=8640
 Environment=BATCH_MINIMUM_SLEEP_MS=4640
+Environment=RETRY_QUEUE_FILE=/var/lib/raw-html-maxxing/retry-queue.json
+Environment=RETRY_BASE_DELAY_MS=30000
+Environment=RETRY_MAX_DELAY_MS=900000
+Environment=RETRY_SAME_ERROR_THRESHOLD=3
+Environment=RETRY_CIRCUIT_DELAY_MS=300000
+Environment=LOGIN_RETRY_DELAY_MS=180000
+Environment=LOGIN_STATE_FILE=/var/lib/raw-html-maxxing/login-state.json
+Environment=ALERT_STATE_FILE=/var/lib/raw-html-maxxing/alert-state.json
+Environment=ALERT_COOLDOWN_MS=3600000
+Environment=INSTANCE_NAME=%H
+EnvironmentFile=-/etc/raw-html-alert.env
+EnvironmentFile=-/etc/raw-html-admin.env
 Environment=NAV_TIMEOUT_MS=90000
 Environment=SETTLE_MS=1000
 Environment=VERIFICATION_TIMEOUT_MS=0
 ExecStart=/usr/bin/node /opt/raw-html-maxxing/src/server.mjs
 Restart=on-failure
 RestartSec=5
+KillMode=control-group
+TasksMax=512
+MemoryHigh=5G
+MemoryMax=6G
 TimeoutStopSec=30
 
 [Install]
@@ -171,6 +187,16 @@ CADDY
 rm -f /etc/systemd/system/raw-html-maxxing.service.d/limits.conf
 
 systemctl daemon-reload
+
+mkdir -p /etc/systemd/journald.conf.d
+cat >/etc/systemd/journald.conf.d/raw-html-limits.conf <<'JOURNAL'
+[Journal]
+SystemMaxUse=256M
+RuntimeMaxUse=64M
+RateLimitIntervalSec=30s
+RateLimitBurst=1000
+JOURNAL
+systemctl restart systemd-journald
 systemctl enable --now raw-html-display.service raw-html-window-manager.service raw-html-vnc.service raw-html-maxxing.service caddy.service
 systemctl restart caddy.service raw-html-maxxing.service
 

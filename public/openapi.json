@@ -38,7 +38,7 @@
     "/api/fetch": {
       "post": {
         "summary": "Capture rendered HTML",
-        "description": "Dynamic request endpoint. Accepts one eBay URL and returns the complete rendered DOM directly as the text/html response body. Send the next request after the prior response finishes and honor Retry-After on HTTP 429. Accepted uncached captures count toward the shared 10,000-capture rolling 24-hour allowance; busy retries and cache hits do not. Use the batch endpoint for a one-time bulk submission. An active batch has priority over uncached dynamic requests.",
+        "description": "Dynamic request endpoint. Accepts one eBay URL and returns the complete rendered DOM directly as the text/html response body. Send the next request after the prior response finishes and honor Retry-After on HTTP 202, 429, or 503. If eBay login is lost, incoming URLs are persisted while the service waits three minutes between login probes; repeat the same URL after recovery to receive the cached result. Other failed captures remain in the automatic retry queue. Accepted uncached captures and retry attempts count toward the shared 10,000-capture rolling 24-hour allowance. Use the batch endpoint for a one-time bulk submission. An active batch has priority over uncached dynamic requests except while login recovery is accepting queued work.",
         "operationId": "captureRenderedHtml",
         "requestBody": {
           "required": true,
@@ -84,6 +84,19 @@
               }
             }
           },
+          "202": {
+            "description": "The URL was accepted into the persistent queue while eBay login is being restored.",
+            "headers": {
+              "Retry-After": { "description": "Seconds until the next login probe.", "schema": { "type": "integer", "minimum": 1 } },
+              "X-Retry-Id": { "description": "Persistent retry identifier.", "schema": { "type": "string", "format": "uuid" } }
+            },
+            "content": {
+              "application/json": {
+                "schema": { "type": "object" },
+                "example": { "status": "waiting_for_login", "message": "Please Wait, Logging In", "retryId": "00000000-0000-4000-8000-000000000000", "retryAt": "2026-09-01T18:03:00.000Z" }
+              }
+            }
+          },
           "400": {
             "$ref": "#/components/responses/BadRequest"
           },
@@ -110,11 +123,15 @@
             }
           },
           "503": {
-            "description": "The persistent eBay browser session requires operator authentication.",
+            "description": "Capture is temporarily unavailable and has been added to the persistent retry queue.",
+            "headers": {
+              "Retry-After": { "description": "Seconds until the next automatic attempt.", "schema": { "type": "integer", "minimum": 1 } },
+              "X-Retry-Id": { "description": "Persistent retry identifier.", "schema": { "type": "string", "format": "uuid" } }
+            },
             "content": {
-              "text/plain": {
-                "schema": { "type": "string" },
-                "example": "eBay authentication is required on the capture server. Please contact the site operator."
+              "application/json": {
+                "schema": { "type": "object" },
+                "example": { "error": "Capture temporarily unavailable; queued for automatic retry.", "retryId": "00000000-0000-4000-8000-000000000000", "retryAt": "2026-08-30T18:00:00.000Z" }
               }
             }
           },
@@ -130,7 +147,7 @@
     "/api/batches": {
       "post": {
         "summary": "Submit a paced HTML batch",
-        "description": "Accepts 1 to 10,000 distinct eBay URLs in one request and immediately returns a batch identifier. One persistent browser processes the URLs in order, targeting one capture start every 8.64 seconds and sleeping at least 4.64 seconds after each completed capture. Only one batch may be active at a time. If interactive verification appears, the current capture and queue wait indefinitely until the operator completes it.",
+        "description": "Accepts 1 to 10,000 distinct eBay URLs in one request and immediately returns a batch identifier. One persistent browser processes the URLs in order, targeting one capture start every 8.64 seconds and sleeping at least 4.64 seconds after each completed capture. Failed items remain in the persistent queue with exponential backoff. Three matching failures open a five-minute circuit before the next probe; a successful probe releases matching queued work immediately. Only one batch may be active at a time.",
         "operationId": "submitCaptureBatch",
         "requestBody": {
           "required": true,
@@ -261,6 +278,7 @@
           "total": { "type": "integer" },
           "completed": { "type": "integer" },
           "failed": { "type": "integer" },
+          "retrying": { "type": "integer" },
           "remaining": { "type": "integer" },
           "statusUrl": { "type": "string" },
           "items": { "type": "array", "items": { "type": "object" } }
@@ -283,9 +301,11 @@
               "properties": {
                 "index": { "type": "integer" },
                 "url": { "type": "string", "format": "uri" },
-                "status": { "type": "string", "enum": ["complete", "failed"] },
+                "status": { "type": "string", "enum": ["complete", "failed", "retrying"] },
                 "html": { "type": "string", "description": "Complete rendered HTML when status is complete." },
-                "error": { "type": "string" }
+                "error": { "type": "string" },
+                "attempt": { "type": "integer" },
+                "retryAt": { "type": "string", "format": "date-time" }
               }
             }
           }

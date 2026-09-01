@@ -45,6 +45,20 @@ export function parseArgs(argv, env = process.env) {
     batchRequestMaxBytes: Number(env.BATCH_REQUEST_MAX_BYTES || 33_554_432),
     batchStartIntervalMs: Number(env.BATCH_START_INTERVAL_MS || 8_640),
     batchMinimumSleepMs: Number(env.BATCH_MINIMUM_SLEEP_MS || 4_640),
+    retryQueueFile: path.resolve(env.RETRY_QUEUE_FILE || path.join(rootDir, ".tmp/retry-queue.json")),
+    retryBaseDelayMs: Number(env.RETRY_BASE_DELAY_MS || 30_000),
+    retryMaxDelayMs: Number(env.RETRY_MAX_DELAY_MS || 900_000),
+    retrySameErrorThreshold: Number(env.RETRY_SAME_ERROR_THRESHOLD || 3),
+    retryCircuitDelayMs: Number(env.RETRY_CIRCUIT_DELAY_MS || 300_000),
+    loginRetryDelayMs: Number(env.LOGIN_RETRY_DELAY_MS || 180_000),
+    loginStateFile: path.resolve(env.LOGIN_STATE_FILE || path.join(rootDir, ".tmp/login-state.json")),
+    alertStateFile: path.resolve(env.ALERT_STATE_FILE || path.join(rootDir, ".tmp/alert-state.json")),
+    alertCooldownMs: Number(env.ALERT_COOLDOWN_MS || 3_600_000),
+    alertEmailTo: String(env.ALERT_EMAIL_TO || "").trim(),
+    alertEmailFrom: String(env.ALERT_EMAIL_FROM || "").trim(),
+    resendApiKey: String(env.RESEND_API_KEY || "").trim(),
+    adminStatusToken: String(env.ADMIN_STATUS_TOKEN || "").trim(),
+    instanceName: String(env.INSTANCE_NAME || env.HOSTNAME || "raw-html-maxxing").trim(),
     allowHosts: String(env.ALLOW_HOSTS || "ebay.com,www.ebay.com")
       .split(",")
       .map((value) => value.trim().toLowerCase())
@@ -104,6 +118,12 @@ export function parseArgs(argv, env = process.env) {
   if (!Number.isInteger(args.batchRequestMaxBytes) || args.batchRequestMaxBytes < 1_024) throw new Error("Batch request size limit must be at least 1024 bytes");
   if (!Number.isFinite(args.batchStartIntervalMs) || args.batchStartIntervalMs < 1_000) throw new Error("Batch start interval must be at least 1000ms");
   if (!Number.isFinite(args.batchMinimumSleepMs) || args.batchMinimumSleepMs < 0) throw new Error("Batch minimum sleep cannot be negative");
+  if (!Number.isFinite(args.retryBaseDelayMs) || args.retryBaseDelayMs < 1_000) throw new Error("Retry base delay must be at least 1000ms");
+  if (!Number.isFinite(args.retryMaxDelayMs) || args.retryMaxDelayMs < args.retryBaseDelayMs) throw new Error("Retry max delay must be at least the base delay");
+  if (!Number.isInteger(args.retrySameErrorThreshold) || args.retrySameErrorThreshold < 2) throw new Error("Retry same-error threshold must be at least 2");
+  if (!Number.isFinite(args.retryCircuitDelayMs) || args.retryCircuitDelayMs < 1_000) throw new Error("Retry circuit delay must be at least 1000ms");
+  if (!Number.isFinite(args.loginRetryDelayMs) || args.loginRetryDelayMs < 1_000) throw new Error("Login retry delay must be at least 1000ms");
+  if (!Number.isFinite(args.alertCooldownMs) || args.alertCooldownMs < 1_000) throw new Error("Alert cooldown must be at least 1000ms");
   if (args.allowHosts.length === 0) throw new Error("At least one allowed host is required");
   return args;
 }
@@ -136,12 +156,111 @@ export function createRollingRateLimiter(maxRequests, windowMs, initialEvents = 
   };
 }
 
+export async function htmlCacheStats(cacheDir) {
+  let entries;
+  try {
+    entries = await fs.readdir(cacheDir, { withFileTypes: true });
+  } catch (error) {
+    if (error?.code === "ENOENT") return { files: 0, bytes: 0 };
+    throw error;
+  }
+  const stats = await Promise.all(entries
+    .filter((entry) => entry.isFile() && entry.name.endsWith(".html"))
+    .map((entry) => fs.stat(path.join(cacheDir, entry.name)).catch(() => null)));
+  return {
+    files: stats.filter(Boolean).length,
+    bytes: stats.reduce((total, stat) => total + Number(stat?.size || 0), 0)
+  };
+}
+
+export function bearerTokenMatches(header, expectedToken) {
+  if (!expectedToken) return false;
+  const supplied = String(header || "").replace(/^Bearer\s+/i, "");
+  const suppliedBuffer = Buffer.from(supplied);
+  const expectedBuffer = Buffer.from(expectedToken);
+  return suppliedBuffer.length === expectedBuffer.length
+    && crypto.timingSafeEqual(suppliedBuffer, expectedBuffer);
+}
+
 export function randomDelayMs(minMs, maxMs, random = Math.random) {
   return Math.floor(minMs + random() * (maxMs - minMs + 1));
 }
 
 export function nextBatchCaptureAt(startedAt, finishedAt, startIntervalMs, minimumSleepMs) {
   return Math.max(startedAt + startIntervalMs, finishedAt + minimumSleepMs);
+}
+
+export function normalizeFailure(error) {
+  return String(error?.message || error || "Unknown capture failure")
+    .replace(/https?:\/\/\S+/gi, "<url>")
+    .replace(/\b\d{2,}\b/g, "<n>")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 500);
+}
+
+export function retryDelayMs(attempt, baseDelayMs, maxDelayMs) {
+  return Math.min(maxDelayMs, baseDelayMs * (2 ** Math.max(0, attempt - 1)));
+}
+
+export function latestBatchEvents(events) {
+  const latest = new Map();
+  for (const event of events) latest.set(event.index, event);
+  return [...latest.values()].sort((a, b) => a.index - b.index);
+}
+
+async function readJsonFile(file, fallback) {
+  try {
+    return JSON.parse(await fs.readFile(file, "utf8"));
+  } catch (error) {
+    if (error?.code === "ENOENT") return fallback;
+    throw error;
+  }
+}
+
+function createAlertManager(args) {
+  let stateQueue = Promise.resolve();
+  const emit = (kind, message, details = {}) => {
+    stateQueue = stateQueue.then(async () => {
+      const state = await readJsonFile(args.alertStateFile, { sent: {} });
+      const now = Date.now();
+      if (now - Number(state.sent?.[kind] || 0) < args.alertCooldownMs) return false;
+      const subject = `[raw-html] ${args.instanceName}: ${kind}`;
+      const body = [
+        `Instance: ${args.instanceName}`,
+        `Time: ${new Date(now).toISOString()}`,
+        `Condition: ${kind}`,
+        `Message: ${message}`,
+        ...Object.entries(details).map(([key, value]) => `${key}: ${value}`)
+      ].join("\n");
+      let delivered = false;
+      if (args.alertEmailTo && args.alertEmailFrom && args.resendApiKey) {
+        const response = await fetch("https://api.resend.com/emails", {
+          method: "POST",
+          headers: {
+            authorization: `Bearer ${args.resendApiKey}`,
+            "content-type": "application/json"
+          },
+          body: JSON.stringify({ from: args.alertEmailFrom, to: [args.alertEmailTo], subject, text: body })
+        });
+        if (!response.ok) throw new Error(`Alert email provider returned HTTP ${response.status}`);
+        delivered = true;
+      } else {
+        const outbox = `${args.alertStateFile}.outbox.ndjson`;
+        await fs.mkdir(path.dirname(outbox), { recursive: true });
+        await fs.appendFile(outbox, `${JSON.stringify({ createdAt: new Date(now).toISOString(), kind, subject, body })}\n`, "utf8");
+      }
+      state.sent = { ...(state.sent || {}), [kind]: now };
+      await writeJsonAtomic(args.alertStateFile, state);
+      console.error(`[raw-html] alert ${delivered ? "emailed" : "queued without email configuration"}: ${kind}`);
+      return delivered;
+    }).catch((error) => {
+      console.error(`[raw-html] alert delivery failed: ${String(error?.message || error)}`);
+      return false;
+    });
+    return stateQueue;
+  };
+  return { emit };
 }
 
 function cachePath(cacheDir, targetUrl) {
@@ -292,6 +411,10 @@ export function isInteractiveBlock(title, body, url) {
     || /signin\.ebay\.com|\/splashui\/captcha/i.test(url);
 }
 
+export function isAuthenticationFailure(error) {
+  return /eBay authentication is required|sign[ -]?in.*required|captcha|human.verification/i.test(String(error?.message || error));
+}
+
 export function minimumCaptureLength(targetUrl) {
   const parsed = new URL(targetUrl);
   return /\/sch(?:\/|$)/i.test(parsed.pathname) ? 250_000 : 25_000;
@@ -339,23 +462,17 @@ async function waitForManualVerification(page, args) {
   });
   let state = await inspect();
   if (!isInteractiveBlock(state.title, state.body, state.url)) return;
-  if (args.headless) throw new Error("eBay authentication is required on the capture server.");
+  await args.onInteractiveBlock?.({ title: state.title, url: state.url });
   console.log("[raw-html] Complete eBay verification in the opened browser window.");
-  const deadline = args.verificationTimeoutMs === 0 ? null : Date.now() + args.verificationTimeoutMs;
-  while (isInteractiveBlock(state.title, state.body, state.url)) {
-    if (deadline !== null && Date.now() >= deadline) {
-      throw new Error("eBay authentication is required on the capture server. Please contact the site operator.");
-    }
-    await page.waitForTimeout(2_000);
-    state = await inspect();
-  }
+  throw new Error("eBay authentication is required on the capture server. Complete verification through Screen Sharing; the request will remain in the retry queue.");
 }
 
 export async function createCaptureSession(args) {
   const launchOptions = {
     headless: args.headless,
     viewport: { width: 1600, height: 1200 },
-    userAgent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/126 Safari/537.36"
+    userAgent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/126 Safari/537.36",
+    args: ["--disk-cache-size=268435456"]
   };
   if (args.browserChannel && args.browserChannel !== "chromium") launchOptions.channel = args.browserChannel;
 
@@ -373,7 +490,14 @@ export async function createCaptureSession(args) {
     return result;
   };
 
-  return { captureRawHtml, close: () => context.close() };
+  return {
+    captureRawHtml,
+    close: () => context.close(),
+    async getSessionStatus() {
+      const cookies = await context.cookies("https://www.ebay.com").catch(() => []);
+      return { persistentProfile: true, cookieCount: cookies.length };
+    }
+  };
 }
 
 function corsOrigin(req, allowedOrigins) {
@@ -387,7 +511,7 @@ function setCors(req, res, allowedOrigins) {
   if (origin) res.setHeader("access-control-allow-origin", origin);
   res.setHeader("access-control-allow-methods", "GET, POST, OPTIONS");
   res.setHeader("access-control-allow-headers", "content-type");
-  res.setHeader("access-control-expose-headers", "content-disposition, retry-after, x-source-url, x-bytes, x-cache, x-rate-limit-policy");
+  res.setHeader("access-control-expose-headers", "content-disposition, retry-after, x-source-url, x-bytes, x-cache, x-rate-limit-policy, x-retry-id");
   res.setHeader("vary", "Origin");
 }
 
@@ -473,9 +597,11 @@ async function readBatchMeta(batchDir, batchId) {
 }
 
 function batchSummary(meta, events, includeItems = true) {
-  const byIndex = new Map(events.map((event) => [event.index, event]));
-  const completed = events.filter((event) => event.status === "complete").length;
-  const failed = events.filter((event) => event.status === "failed").length;
+  const currentEvents = latestBatchEvents(events);
+  const byIndex = new Map(currentEvents.map((event) => [event.index, event]));
+  const completed = currentEvents.filter((event) => event.status === "complete").length;
+  const failed = currentEvents.filter((event) => event.status === "failed").length;
+  const retrying = currentEvents.filter((event) => event.status === "retrying").length;
   const summary = {
     id: meta.id,
     status: meta.status,
@@ -484,7 +610,8 @@ function batchSummary(meta, events, includeItems = true) {
     total: meta.urls.length,
     completed,
     failed,
-    remaining: meta.urls.length - completed - failed,
+    retrying,
+    remaining: meta.urls.length - completed,
     pacing: {
       targetStartIntervalMs: meta.batchStartIntervalMs,
       minimumSleepAfterCaptureMs: meta.batchMinimumSleepMs
@@ -500,6 +627,8 @@ function batchSummary(meta, events, includeItems = true) {
         url,
         status: event?.status || "queued",
         ...(event?.error ? { error: event.error } : {}),
+        ...(event?.retryAt ? { retryAt: event.retryAt } : {}),
+        ...(event?.attempt ? { attempt: event.attempt } : {}),
         ...(event?.status === "complete" ? { resultUrl: `/api/batches/${meta.id}/results/${index}` } : {})
       };
     });
@@ -508,6 +637,12 @@ function batchSummary(meta, events, includeItems = true) {
 }
 
 export async function runServer(args, { session: injectedSession } = {}) {
+  const alerts = createAlertManager(args);
+  args.onInteractiveBlock = async (state) => alerts.emit(
+    "ebay-interactive-block",
+    "eBay returned a sign-in, CAPTCHA, or human-verification page. Complete it through Screen Sharing.",
+    { pageTitle: state.title || "(no title)" }
+  );
   const session = injectedSession || await createCaptureSession(args);
   const persistedRates = await readRateLimitState(args.stateFile);
   const clientRateLimiter = createRateLimiter(args.rateLimitMax, args.rateLimitWindowMs);
@@ -522,6 +657,173 @@ export async function runServer(args, { session: injectedSession } = {}) {
   let nextCaptureAllowedAt = 0;
   let activeBatch = null;
   let batchRun = Promise.resolve();
+  let retryItems = await readJsonFile(args.retryQueueFile, []);
+  if (!Array.isArray(retryItems)) retryItems = [];
+  let loginPause = await readJsonFile(args.loginStateFile, null);
+  if (!loginPause?.active) loginPause = null;
+  let retryTimer = null;
+  let retryWorkerRunning = false;
+  let lastSuccessfulCaptureAt = null;
+  let lastInteractiveBlockAt = null;
+
+  const originalInteractiveBlock = args.onInteractiveBlock;
+  args.onInteractiveBlock = async (state) => {
+    lastInteractiveBlockAt = new Date().toISOString();
+    await originalInteractiveBlock?.(state);
+  };
+
+  const persistRetryItems = () => writeJsonAtomic(args.retryQueueFile, retryItems);
+  const persistLoginPause = () => writeJsonAtomic(args.loginStateFile, loginPause || { active: false, updatedAt: new Date().toISOString() });
+  const scheduleRetryWorker = (delayMs = 0) => {
+    if (retryTimer) clearTimeout(retryTimer);
+    retryTimer = setTimeout(() => runRetryWorker().catch((error) => {
+      console.error(`[raw-html] retry worker failed: ${String(error?.message || error)}`);
+      scheduleRetryWorker(args.retryBaseDelayMs);
+    }), Math.max(0, delayMs));
+    retryTimer.unref?.();
+  };
+
+  const enterLoginPause = async (error) => {
+    const now = Date.now();
+    const startedAt = loginPause?.startedAt || new Date(now).toISOString();
+    loginPause = {
+      active: true,
+      message: "Please Wait, Logging In",
+      startedAt,
+      probeAt: new Date(now + args.loginRetryDelayMs).toISOString(),
+      lastError: normalizeFailure(error),
+      updatedAt: new Date(now).toISOString()
+    };
+    lastInteractiveBlockAt = new Date(now).toISOString();
+    for (const queued of retryItems) {
+      if (queued.waitingForLogin) queued.nextAttemptAt = loginPause.probeAt;
+    }
+    await Promise.all([persistLoginPause(), persistRetryItems()]);
+    scheduleRetryWorker(args.loginRetryDelayMs);
+    return loginPause;
+  };
+
+  const clearLoginPause = async () => {
+    if (!loginPause?.active) return false;
+    loginPause = null;
+    const now = new Date().toISOString();
+    for (const queued of retryItems) {
+      if (queued.waitingForLogin) {
+        queued.waitingForLogin = false;
+        queued.nextAttemptAt = now;
+        queued.updatedAt = now;
+      }
+    }
+    await Promise.all([persistLoginPause(), persistRetryItems()]);
+    await alerts.emit("capture-login-restored", "eBay login is available again; queued requests were released in arrival order.", {
+      remainingQueued: retryItems.length
+    });
+    return true;
+  };
+
+  const enqueueDirectRetry = async (targetUrl, error, { waitingForLogin = false, countAttempt = true } = {}) => {
+    const now = Date.now();
+    const errorKey = waitingForLogin ? "eBay login required" : normalizeFailure(error);
+    let item = retryItems.find((entry) => entry.url === targetUrl);
+    if (!item) {
+      item = { id: crypto.randomUUID(), url: targetUrl, createdAt: new Date(now).toISOString(), attempts: 0 };
+      retryItems.push(item);
+    }
+    if (countAttempt) item.attempts = Number(item.attempts || 0) + 1;
+    item.lastError = String(error?.message || error);
+    item.errorKey = errorKey;
+    item.waitingForLogin = waitingForLogin;
+    item.updatedAt = new Date(now).toISOString();
+    const sameErrorCount = retryItems.filter((entry) => entry.errorKey === errorKey).length;
+    item.nextAttemptAt = waitingForLogin && loginPause?.active ? loginPause.probeAt : new Date(now + (sameErrorCount >= args.retrySameErrorThreshold
+      ? args.retryCircuitDelayMs
+      : retryDelayMs(item.attempts, args.retryBaseDelayMs, args.retryMaxDelayMs))).toISOString();
+    await persistRetryItems();
+    if (!waitingForLogin && sameErrorCount >= args.retrySameErrorThreshold) {
+      await alerts.emit("grouped-direct-fetch-failures", "Several direct HTML fetches failed with the same error; they remain queued for retry.", {
+        count: sameErrorCount, error: errorKey, retryAt: item.nextAttemptAt
+      });
+    }
+    scheduleRetryWorker(Math.max(0, Date.parse(item.nextAttemptAt) - Date.now()));
+    return item;
+  };
+
+  async function runRetryWorker() {
+    if (retryWorkerRunning || activeBatch || captureInFlight || retryItems.length === 0) {
+      if (retryItems.length > 0) scheduleRetryWorker(10_000);
+      return;
+    }
+    retryWorkerRunning = true;
+    try {
+      retryItems.sort((a, b) => {
+        const dueDifference = Date.parse(a.nextAttemptAt || 0) - Date.parse(b.nextAttemptAt || 0);
+        return dueDifference || Date.parse(a.createdAt || 0) - Date.parse(b.createdAt || 0);
+      });
+      const item = loginPause?.active
+        ? retryItems.find((entry) => entry.waitingForLogin) || retryItems[0]
+        : retryItems[0];
+      if (loginPause?.active && Date.parse(loginPause.probeAt) > Date.now()) {
+        scheduleRetryWorker(Date.parse(loginPause.probeAt) - Date.now());
+        return;
+      }
+      const waitMs = Math.max(0, Date.parse(item.nextAttemptAt || 0) - Date.now(), nextCaptureAllowedAt - Date.now());
+      if (waitMs > 0) {
+        scheduleRetryWorker(waitMs);
+        return;
+      }
+      const cached = await cache.get(item.url);
+      if (cached !== null) {
+        retryItems = retryItems.filter((entry) => entry.id !== item.id);
+        await persistRetryItems();
+        scheduleRetryWorker(0);
+        return;
+      }
+      const captureRate = captureDailyRateLimiter.consume();
+      await persistRates();
+      if (!captureRate.allowed) {
+        item.nextAttemptAt = new Date(Date.now() + captureRate.retryAfterSeconds * 1_000).toISOString();
+        await persistRetryItems();
+        scheduleRetryWorker(captureRate.retryAfterSeconds * 1_000);
+        return;
+      }
+      captureInFlight = true;
+      try {
+        const html = await session.captureRawHtml(item.url);
+        await cache.set(item.url, html);
+        lastSuccessfulCaptureAt = new Date().toISOString();
+        await clearLoginPause();
+        const recoveredErrorKey = item.errorKey;
+        retryItems = retryItems.filter((entry) => entry.id !== item.id);
+        for (const queued of retryItems) {
+          if (queued.errorKey === recoveredErrorKey) queued.nextAttemptAt = new Date().toISOString();
+        }
+        await persistRetryItems();
+        await alerts.emit("capture-availability-restored", "A queued capture succeeded; matching failures were released for immediate retry.", {
+          remainingQueued: retryItems.length
+        });
+      } catch (error) {
+        item.attempts = Number(item.attempts || 0) + 1;
+        item.lastError = String(error?.message || error);
+        const authenticationFailure = isAuthenticationFailure(error);
+        item.errorKey = authenticationFailure ? "eBay login required" : normalizeFailure(error);
+        item.waitingForLogin = authenticationFailure;
+        item.updatedAt = new Date().toISOString();
+        if (authenticationFailure) {
+          await enterLoginPause(error);
+          item.nextAttemptAt = loginPause.probeAt;
+        } else {
+          item.nextAttemptAt = new Date(Date.now() + retryDelayMs(item.attempts, args.retryBaseDelayMs, args.retryMaxDelayMs)).toISOString();
+          await persistRetryItems();
+        }
+      } finally {
+        captureInFlight = false;
+        nextCaptureAllowedAt = Date.now() + args.captureDelayMinMs;
+      }
+      scheduleRetryWorker(retryItems.length > 0 ? 0 : args.retryBaseDelayMs);
+    } finally {
+      retryWorkerRunning = false;
+    }
+  }
 
   const persistBatchMeta = async (meta) => {
     meta.updatedAt = new Date().toISOString();
@@ -534,70 +836,77 @@ export async function runServer(args, { session: injectedSession } = {}) {
     delete meta.pauseReason;
     await persistBatchMeta(meta);
     const existingEvents = await readBatchProgress(args.batchDir, meta.id);
-    const finishedIndexes = new Set(existingEvents.map((event) => event.index));
+    const currentEvents = latestBatchEvents(existingEvents);
+    const finishedIndexes = new Set(currentEvents.filter((event) => event.status === "complete").map((event) => event.index));
+    const previousByIndex = new Map(currentEvents.map((event) => [event.index, event]));
+    const sameErrorCounts = new Map();
     let nextBatchStartAt = 0;
 
     for (let index = 0; index < meta.urls.length; index += 1) {
       if (finishedIndexes.has(index)) continue;
       const targetUrl = meta.urls[index];
-      const cachedHtml = await cache.get(targetUrl);
-      if (cachedHtml !== null) {
-        await appendBatchProgress(args.batchDir, meta.id, {
-          index,
-          status: "complete",
-          bytes: Buffer.byteLength(cachedHtml),
-          cached: true,
-          completedAt: new Date().toISOString()
-        });
-        continue;
-      }
-
-      const waitMs = Math.max(0, nextBatchStartAt - Date.now());
-      if (waitMs > 0) await new Promise((resolve) => setTimeout(resolve, waitMs));
-
-      let captureRate = captureDailyRateLimiter.consume();
-      if (!captureRate.allowed) {
-        await new Promise((resolve) => setTimeout(resolve, captureRate.retryAfterSeconds * 1_000));
-        captureRate = captureDailyRateLimiter.consume();
-      }
-      await persistRates();
-      if (!captureRate.allowed) throw new Error("Daily capture limiter did not reopen after Retry-After");
-
-      const startedAt = Date.now();
-      captureInFlight = true;
-      try {
-        const html = await session.captureRawHtml(targetUrl);
-        await cache.set(targetUrl, html);
-        await appendBatchProgress(args.batchDir, meta.id, {
-          index,
-          status: "complete",
-          bytes: Buffer.byteLength(html),
-          cached: false,
-          completedAt: new Date().toISOString()
-        });
-      } catch (error) {
-        const message = String(error?.message || error);
-        if (/eBay authentication is required/i.test(message)) {
-          meta.status = "paused";
-          meta.pauseReason = message;
-          await persistBatchMeta(meta);
-          return;
+      let attempt = Number(previousByIndex.get(index)?.attempt || 0);
+      let retryAt = Date.parse(previousByIndex.get(index)?.retryAt || 0) || 0;
+      while (true) {
+        const cachedHtml = await cache.get(targetUrl);
+        if (cachedHtml !== null) {
+          await appendBatchProgress(args.batchDir, meta.id, {
+            index, status: "complete", bytes: Buffer.byteLength(cachedHtml), cached: true,
+            attempt, completedAt: new Date().toISOString()
+          });
+          break;
         }
-        await appendBatchProgress(args.batchDir, meta.id, {
-          index,
-          status: "failed",
-          error: message,
-          completedAt: new Date().toISOString()
-        });
-      } finally {
-        const finishedAt = Date.now();
-        nextBatchStartAt = nextBatchCaptureAt(
-          startedAt,
-          finishedAt,
-          args.batchStartIntervalMs,
-          args.batchMinimumSleepMs
-        );
-        captureInFlight = false;
+
+        const waitMs = Math.max(0, nextBatchStartAt - Date.now(), retryAt - Date.now());
+        if (waitMs > 0) await new Promise((resolve) => setTimeout(resolve, waitMs));
+
+        let captureRate = captureDailyRateLimiter.consume();
+        if (!captureRate.allowed) {
+          await new Promise((resolve) => setTimeout(resolve, captureRate.retryAfterSeconds * 1_000));
+          captureRate = captureDailyRateLimiter.consume();
+        }
+        await persistRates();
+        if (!captureRate.allowed) throw new Error("Daily capture limiter did not reopen after Retry-After");
+
+        const startedAt = Date.now();
+        captureInFlight = true;
+        try {
+          attempt += 1;
+          const html = await session.captureRawHtml(targetUrl);
+          await cache.set(targetUrl, html);
+          lastSuccessfulCaptureAt = new Date().toISOString();
+          await clearLoginPause();
+          await appendBatchProgress(args.batchDir, meta.id, {
+            index, status: "complete", bytes: Buffer.byteLength(html), cached: false,
+            attempt, completedAt: new Date().toISOString()
+          });
+          sameErrorCounts.clear();
+          break;
+        } catch (error) {
+          const message = String(error?.message || error);
+          const errorKey = normalizeFailure(error);
+          const sameErrorCount = (sameErrorCounts.get(errorKey) || 0) + 1;
+          sameErrorCounts.set(errorKey, sameErrorCount);
+          const authenticationFailure = isAuthenticationFailure(error);
+          if (authenticationFailure) await enterLoginPause(error);
+          const delayMs = authenticationFailure ? args.loginRetryDelayMs : sameErrorCount >= args.retrySameErrorThreshold
+            ? args.retryCircuitDelayMs
+            : retryDelayMs(attempt, args.retryBaseDelayMs, args.retryMaxDelayMs);
+          retryAt = Date.now() + delayMs;
+          await appendBatchProgress(args.batchDir, meta.id, {
+            index, status: authenticationFailure ? "waiting_for_login" : "retrying", error: message, errorKey, attempt,
+            sameErrorCount, retryAt: new Date(retryAt).toISOString(), failedAt: new Date().toISOString()
+          });
+          if (sameErrorCount >= args.retrySameErrorThreshold) {
+            await alerts.emit("grouped-capture-failures", "Several captures failed with the same error; the queue is paused before probing again.", {
+              count: sameErrorCount, error: errorKey, retryAt: new Date(retryAt).toISOString()
+            });
+          }
+        } finally {
+          const finishedAt = Date.now();
+          nextBatchStartAt = nextBatchCaptureAt(startedAt, finishedAt, args.batchStartIntervalMs, args.batchMinimumSleepMs);
+          captureInFlight = false;
+        }
       }
     }
 
@@ -639,6 +948,79 @@ export async function runServer(args, { session: injectedSession } = {}) {
       if (req.method === "GET" && requestUrl.pathname === "/api/health") {
         res.writeHead(200, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
         res.end(JSON.stringify({ ok: true }));
+        return;
+      }
+
+      if (req.method === "GET" && requestUrl.pathname === "/api/admin/status") {
+        if (!args.adminStatusToken) {
+          res.writeHead(503, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
+          res.end(JSON.stringify({ error: "Admin status is not configured." }));
+          return;
+        }
+        if (!bearerTokenMatches(req.headers.authorization, args.adminStatusToken)) {
+          res.writeHead(401, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
+          res.end(JSON.stringify({ error: "Unauthorized" }));
+          return;
+        }
+        const now = Date.now();
+        const [cacheStats, browserSession] = await Promise.all([
+          htmlCacheStats(args.cacheDir),
+          session.getSessionStatus?.() || Promise.resolve({ persistentProfile: true, cookieCount: null })
+        ]);
+        const requestEvents = requestDailyRateLimiter.snapshot(now);
+        const captureEvents = captureDailyRateLimiter.snapshot(now);
+        const groupedFailures = new Map();
+        for (const item of retryItems) {
+          const key = item.errorKey || "Unknown failure";
+          const current = groupedFailures.get(key) || { error: key, count: 0, nextAttemptAt: null };
+          current.count += 1;
+          if (!current.nextAttemptAt || Date.parse(item.nextAttemptAt || 0) < Date.parse(current.nextAttemptAt || 0)) {
+            current.nextAttemptAt = item.nextAttemptAt || null;
+          }
+          groupedFailures.set(key, current);
+        }
+        res.writeHead(200, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
+        res.end(JSON.stringify({
+          ok: true,
+          instanceName: args.instanceName,
+          capturedAt: new Date(now).toISOString(),
+          html: cacheStats,
+          usage: {
+            requests: { used: requestEvents.length, limit: args.dailyRateLimitMax },
+            captures: { used: captureEvents.length, limit: args.captureDailyRateLimitMax }
+          },
+          retryQueue: {
+            count: retryItems.length,
+            workerRunning: retryWorkerRunning,
+            groups: [...groupedFailures.values()].sort((a, b) => b.count - a.count).slice(0, 10)
+          },
+          batch: activeBatch ? {
+            id: activeBatch.id,
+            status: activeBatch.status,
+            total: activeBatch.urls.length,
+            updatedAt: activeBatch.updatedAt,
+            ...(activeBatch.pauseReason ? { pauseReason: normalizeFailure(activeBatch.pauseReason) } : {})
+          } : null,
+          capture: { inFlight: captureInFlight, lastSuccessfulAt: lastSuccessfulCaptureAt },
+          login: loginPause?.active ? {
+            state: "waiting_for_login",
+            message: loginPause.message,
+            pausedAt: loginPause.startedAt,
+            nextProbeAt: loginPause.probeAt,
+            queuedDuringPause: retryItems.filter((item) => item.waitingForLogin).length
+          } : {
+            state: "ready",
+            message: null,
+            pausedAt: null,
+            nextProbeAt: null,
+            queuedDuringPause: 0
+          },
+          browserSession: {
+            persistentProfile: browserSession.persistentProfile !== false,
+            cookieCount: Number.isInteger(browserSession.cookieCount) ? browserSession.cookieCount : null,
+            lastInteractiveBlockAt
+          }
+        }));
         return;
       }
 
@@ -701,7 +1083,7 @@ export async function runServer(args, { session: injectedSession } = {}) {
           res.end(JSON.stringify({ error: "after must be an integer of -1 or greater; limit must be between 1 and 10" }));
           return;
         }
-        const events = (await readBatchProgress(args.batchDir, meta.id))
+        const events = latestBatchEvents(await readBatchProgress(args.batchDir, meta.id))
           .filter((event) => event.index > after)
           .sort((a, b) => a.index - b.index);
         const page = events.slice(0, requestedLimit);
@@ -716,6 +1098,8 @@ export async function runServer(args, { session: injectedSession } = {}) {
             url,
             status: event.status,
             ...(event.error ? { error: event.error } : {}),
+            ...(event.retryAt ? { retryAt: event.retryAt } : {}),
+            ...(event.attempt ? { attempt: event.attempt } : {}),
             ...(event.status === "complete" ? { html } : {})
           };
         }));
@@ -740,7 +1124,7 @@ export async function runServer(args, { session: injectedSession } = {}) {
           res.end("Batch result not found");
           return;
         }
-        const events = await readBatchProgress(args.batchDir, meta.id);
+        const events = latestBatchEvents(await readBatchProgress(args.batchDir, meta.id));
         const event = events.find((entry) => entry.index === index && entry.status === "complete");
         const html = event ? await cache.get(meta.urls[index]) : null;
         if (html === null) {
@@ -794,6 +1178,35 @@ export async function runServer(args, { session: injectedSession } = {}) {
             "x-bytes": String(Buffer.byteLength(cachedHtml))
           });
           res.end(cachedHtml);
+          return;
+        }
+
+        if (loginPause?.active) {
+          const requestRate = requestDailyRateLimiter.consume();
+          await persistRates();
+          if (!requestRate.allowed) {
+            res.writeHead(429, {
+              "content-type": "text/plain; charset=utf-8",
+              "cache-control": "no-store",
+              "retry-after": String(requestRate.retryAfterSeconds)
+            });
+            res.end("Daily API request limit reached. Retry after the indicated delay.");
+            return;
+          }
+          const retry = await enqueueDirectRetry(targetUrl, "eBay login is pending", { waitingForLogin: true, countAttempt: false });
+          const retryAfterSeconds = Math.max(1, Math.ceil((Date.parse(loginPause.probeAt) - Date.now()) / 1_000));
+          res.writeHead(202, {
+            "content-type": "application/json; charset=utf-8",
+            "cache-control": "no-store",
+            "retry-after": String(retryAfterSeconds),
+            "x-retry-id": retry.id
+          });
+          res.end(JSON.stringify({
+            status: "waiting_for_login",
+            message: "Please Wait, Logging In",
+            retryId: retry.id,
+            retryAt: loginPause.probeAt
+          }));
           return;
         }
 
@@ -853,6 +1266,30 @@ export async function runServer(args, { session: injectedSession } = {}) {
           if (waitMs > 0) await new Promise((resolve) => setTimeout(resolve, waitMs));
           html = await session.captureRawHtml(targetUrl);
           await cache.set(targetUrl, html);
+          lastSuccessfulCaptureAt = new Date().toISOString();
+          await clearLoginPause();
+        } catch (error) {
+          const authenticationFailure = isAuthenticationFailure(error);
+          if (authenticationFailure) await enterLoginPause(error);
+          const retry = await enqueueDirectRetry(targetUrl, error, { waitingForLogin: authenticationFailure });
+          const retryAfterSeconds = Math.max(1, Math.ceil((Date.parse(retry.nextAttemptAt) - Date.now()) / 1_000));
+          res.writeHead(authenticationFailure ? 202 : 503, {
+            "content-type": "application/json; charset=utf-8",
+            "cache-control": "no-store",
+            "retry-after": String(retryAfterSeconds),
+            "x-retry-id": retry.id
+          });
+          res.end(JSON.stringify(authenticationFailure ? {
+            status: "waiting_for_login",
+            message: "Please Wait, Logging In",
+            retryId: retry.id,
+            retryAt: retry.nextAttemptAt
+          } : {
+            error: "Capture temporarily unavailable; queued for automatic retry.",
+            retryId: retry.id,
+            retryAt: retry.nextAttemptAt
+          }));
+          return;
         } finally {
           nextCaptureAllowedAt = Date.now() + randomDelayMs(args.captureDelayMinMs, args.captureDelayMaxMs);
           captureInFlight = false;
@@ -887,9 +1324,11 @@ export async function runServer(args, { session: injectedSession } = {}) {
     server.listen(args.port, args.host, resolve);
   });
   console.log(`[raw-html] listening on http://${args.host}:${args.port}`);
+  if (retryItems.length > 0) scheduleRetryWorker(0);
 
   const shutdown = async (signal) => {
     console.log(`[raw-html] ${signal}; shutting down`);
+    if (retryTimer) clearTimeout(retryTimer);
     await new Promise((resolve) => server.close(resolve));
     await session.close();
   };

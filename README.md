@@ -117,6 +117,32 @@ and retry that same URL. Accepted uncached captures count toward the shared
 consume that allowance. Do not run dynamic uncached requests while a bulk batch
 is active—the batch has priority.
 
+If an upstream page fails, `POST /api/fetch` returns HTTP `503` with
+`Retry-After` and `X-Retry-Id`. The URL is stored in the VM's persistent retry
+queue. Retry the same URL after the indicated delay; once the background retry
+succeeds, the HTML is returned from cache. Batch failures remain `retrying`,
+back off exponentially, and are not discarded as terminal failures. Three
+matching errors open a five-minute circuit; a successful probe releases
+matching queued work immediately.
+
+If eBay requires login or interactive verification, the gateway enters a
+persistent three-minute login pause. New dynamic requests remain accepted in
+arrival order and receive HTTP `202` with `Please Wait, Logging In`, a retry ID,
+and the next probe time. The first successful probe releases the queued URLs
+immediately so processing continues from the point where authentication stopped.
+
+Operational alerts are deduplicated for one hour. Configure email delivery on
+each VM in `/etc/raw-html-alert.env`:
+
+```dotenv
+ALERT_EMAIL_TO=operator@example.com
+ALERT_EMAIL_FROM="Raw HTML Alerts <alerts@your-verified-domain.example>"
+RESEND_API_KEY=re_...
+```
+
+Without those values, alerts are preserved in
+`/var/lib/raw-html-maxxing/alert-state.json.outbox.ndjson` but cannot be emailed.
+
 ## Keep VM screen sharing available
 
 The VM bootstrap runs `x11vnc` with `-forever -shared` under an always-restarting
