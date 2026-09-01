@@ -467,7 +467,7 @@ async function waitForManualVerification(page, args) {
   throw new Error("eBay authentication is required on the capture server. Complete verification through Screen Sharing; the request will remain in the retry queue.");
 }
 
-export async function createCaptureSession(args) {
+export async function createCaptureSession(args, { autoStart = true } = {}) {
   const launchOptions = {
     headless: args.headless,
     viewport: { width: 1600, height: 1200 },
@@ -476,12 +476,28 @@ export async function createCaptureSession(args) {
   };
   if (args.browserChannel && args.browserChannel !== "chromium") launchOptions.channel = args.browserChannel;
 
-  const context = await chromium.launchPersistentContext(args.userDataDir, launchOptions);
-  const page = context.pages()[0] || await context.newPage();
+  let context = null;
+  let page = null;
   let queue = Promise.resolve();
+
+  const start = async () => {
+    if (context && page) return;
+    context = await chromium.launchPersistentContext(args.userDataDir, launchOptions);
+    page = context.pages()[0] || await context.newPage();
+  };
+
+  const stop = async () => {
+    const failedContext = context;
+    context = null;
+    page = null;
+    if (failedContext) await failedContext.close().catch(() => {});
+  };
+
+  if (autoStart) await start();
 
   const captureRawHtml = (targetUrl) => {
     const capture = async () => {
+      if (!page) throw new Error("The headed browser is stopped for automatic recovery");
       await page.goto(targetUrl, { waitUntil: "domcontentloaded", timeout: args.navTimeoutMs });
       return captureStablePageContent(page, targetUrl, args);
     };
@@ -492,10 +508,12 @@ export async function createCaptureSession(args) {
 
   return {
     captureRawHtml,
-    close: () => context.close(),
+    start,
+    stop,
+    close: stop,
     async getSessionStatus() {
-      const cookies = await context.cookies("https://www.ebay.com").catch(() => []);
-      return { persistentProfile: true, cookieCount: cookies.length };
+      const cookies = context ? await context.cookies("https://www.ebay.com").catch(() => []) : [];
+      return { persistentProfile: true, browserRunning: Boolean(context && page), cookieCount: cookies.length };
     }
   };
 }
@@ -643,7 +661,9 @@ export async function runServer(args, { session: injectedSession } = {}) {
     "eBay returned a sign-in, CAPTCHA, or human-verification page. Complete it through Screen Sharing.",
     { pageTitle: state.title || "(no title)" }
   );
-  const session = injectedSession || await createCaptureSession(args);
+  let recoveryPause = await readJsonFile(args.loginStateFile, null);
+  if (!recoveryPause?.active) recoveryPause = null;
+  const session = injectedSession || await createCaptureSession(args, { autoStart: !recoveryPause });
   const persistedRates = await readRateLimitState(args.stateFile);
   const clientRateLimiter = createRateLimiter(args.rateLimitMax, args.rateLimitWindowMs);
   const globalRateLimiter = createRateLimiter(args.globalRateLimitMax, args.globalRateLimitWindowMs);
@@ -659,8 +679,6 @@ export async function runServer(args, { session: injectedSession } = {}) {
   let batchRun = Promise.resolve();
   let retryItems = await readJsonFile(args.retryQueueFile, []);
   if (!Array.isArray(retryItems)) retryItems = [];
-  let loginPause = await readJsonFile(args.loginStateFile, null);
-  if (!loginPause?.active) loginPause = null;
   let retryTimer = null;
   let retryWorkerRunning = false;
   let lastSuccessfulCaptureAt = null;
@@ -673,7 +691,7 @@ export async function runServer(args, { session: injectedSession } = {}) {
   };
 
   const persistRetryItems = () => writeJsonAtomic(args.retryQueueFile, retryItems);
-  const persistLoginPause = () => writeJsonAtomic(args.loginStateFile, loginPause || { active: false, updatedAt: new Date().toISOString() });
+  const persistRecoveryPause = () => writeJsonAtomic(args.loginStateFile, recoveryPause || { active: false, updatedAt: new Date().toISOString() });
   const scheduleRetryWorker = (delayMs = 0) => {
     if (retryTimer) clearTimeout(retryTimer);
     retryTimer = setTimeout(() => runRetryWorker().catch((error) => {
@@ -683,47 +701,54 @@ export async function runServer(args, { session: injectedSession } = {}) {
     retryTimer.unref?.();
   };
 
-  const enterLoginPause = async (error) => {
+  const enterRecoveryPause = async (error, { stopBrowser = true } = {}) => {
     const now = Date.now();
-    const startedAt = loginPause?.startedAt || new Date(now).toISOString();
-    loginPause = {
+    const authenticationFailure = isAuthenticationFailure(error);
+    const startedAt = recoveryPause?.startedAt || new Date(now).toISOString();
+    recoveryPause = {
       active: true,
-      message: "Please Wait, Logging In",
+      state: authenticationFailure ? "waiting_for_login" : "restarting_browser",
+      message: authenticationFailure ? "Please Wait, Logging In" : "Please Wait, Restarting Browser",
       startedAt,
       probeAt: new Date(now + args.loginRetryDelayMs).toISOString(),
       lastError: normalizeFailure(error),
       updatedAt: new Date(now).toISOString()
     };
-    lastInteractiveBlockAt = new Date(now).toISOString();
+    if (authenticationFailure) lastInteractiveBlockAt = new Date(now).toISOString();
     for (const queued of retryItems) {
-      if (queued.waitingForLogin) queued.nextAttemptAt = loginPause.probeAt;
+      if (queued.waitingForRecovery || queued.waitingForLogin) queued.nextAttemptAt = recoveryPause.probeAt;
     }
-    await Promise.all([persistLoginPause(), persistRetryItems()]);
+    if (stopBrowser) await session.stop?.();
+    await Promise.all([persistRecoveryPause(), persistRetryItems()]);
     scheduleRetryWorker(args.loginRetryDelayMs);
-    return loginPause;
+    await alerts.emit("headed-browser-recovery", "A failed headed browser was stopped; incoming requests remain queued until the three-minute restart probe.", {
+      error: recoveryPause.lastError, retryAt: recoveryPause.probeAt
+    });
+    return recoveryPause;
   };
 
-  const clearLoginPause = async () => {
-    if (!loginPause?.active) return false;
-    loginPause = null;
+  const clearRecoveryPause = async () => {
+    if (!recoveryPause?.active) return false;
+    recoveryPause = null;
     const now = new Date().toISOString();
     for (const queued of retryItems) {
-      if (queued.waitingForLogin) {
+      if (queued.waitingForRecovery || queued.waitingForLogin) {
+        queued.waitingForRecovery = false;
         queued.waitingForLogin = false;
         queued.nextAttemptAt = now;
         queued.updatedAt = now;
       }
     }
-    await Promise.all([persistLoginPause(), persistRetryItems()]);
-    await alerts.emit("capture-login-restored", "eBay login is available again; queued requests were released in arrival order.", {
+    await Promise.all([persistRecoveryPause(), persistRetryItems()]);
+    await alerts.emit("capture-browser-restored", "The headed browser recovered; queued requests were released in arrival order.", {
       remainingQueued: retryItems.length
     });
     return true;
   };
 
-  const enqueueDirectRetry = async (targetUrl, error, { waitingForLogin = false, countAttempt = true } = {}) => {
+  const enqueueDirectRetry = async (targetUrl, error, { waitingForRecovery = false, countAttempt = true } = {}) => {
     const now = Date.now();
-    const errorKey = waitingForLogin ? "eBay login required" : normalizeFailure(error);
+    const errorKey = waitingForRecovery ? (recoveryPause?.state === "waiting_for_login" ? "eBay login required" : "Headed browser restarting") : normalizeFailure(error);
     let item = retryItems.find((entry) => entry.url === targetUrl);
     if (!item) {
       item = { id: crypto.randomUUID(), url: targetUrl, createdAt: new Date(now).toISOString(), attempts: 0 };
@@ -732,14 +757,15 @@ export async function runServer(args, { session: injectedSession } = {}) {
     if (countAttempt) item.attempts = Number(item.attempts || 0) + 1;
     item.lastError = String(error?.message || error);
     item.errorKey = errorKey;
-    item.waitingForLogin = waitingForLogin;
+    item.waitingForRecovery = waitingForRecovery;
+    item.waitingForLogin = waitingForRecovery && recoveryPause?.state === "waiting_for_login";
     item.updatedAt = new Date(now).toISOString();
     const sameErrorCount = retryItems.filter((entry) => entry.errorKey === errorKey).length;
-    item.nextAttemptAt = waitingForLogin && loginPause?.active ? loginPause.probeAt : new Date(now + (sameErrorCount >= args.retrySameErrorThreshold
+    item.nextAttemptAt = waitingForRecovery && recoveryPause?.active ? recoveryPause.probeAt : new Date(now + (sameErrorCount >= args.retrySameErrorThreshold
       ? args.retryCircuitDelayMs
       : retryDelayMs(item.attempts, args.retryBaseDelayMs, args.retryMaxDelayMs))).toISOString();
     await persistRetryItems();
-    if (!waitingForLogin && sameErrorCount >= args.retrySameErrorThreshold) {
+    if (!waitingForRecovery && sameErrorCount >= args.retrySameErrorThreshold) {
       await alerts.emit("grouped-direct-fetch-failures", "Several direct HTML fetches failed with the same error; they remain queued for retry.", {
         count: sameErrorCount, error: errorKey, retryAt: item.nextAttemptAt
       });
@@ -759,12 +785,22 @@ export async function runServer(args, { session: injectedSession } = {}) {
         const dueDifference = Date.parse(a.nextAttemptAt || 0) - Date.parse(b.nextAttemptAt || 0);
         return dueDifference || Date.parse(a.createdAt || 0) - Date.parse(b.createdAt || 0);
       });
-      const item = loginPause?.active
-        ? retryItems.find((entry) => entry.waitingForLogin) || retryItems[0]
+      const item = recoveryPause?.active
+        ? retryItems.find((entry) => entry.waitingForRecovery || entry.waitingForLogin) || retryItems[0]
         : retryItems[0];
-      if (loginPause?.active && Date.parse(loginPause.probeAt) > Date.now()) {
-        scheduleRetryWorker(Date.parse(loginPause.probeAt) - Date.now());
+      if (recoveryPause?.active && Date.parse(recoveryPause.probeAt) > Date.now()) {
+        scheduleRetryWorker(Date.parse(recoveryPause.probeAt) - Date.now());
         return;
+      }
+      let browserAvailableForLogin = false;
+      if (recoveryPause?.active) {
+        try {
+          await session.start?.();
+          browserAvailableForLogin = true;
+        } catch (error) {
+          await enterRecoveryPause(error);
+          return;
+        }
       }
       const waitMs = Math.max(0, Date.parse(item.nextAttemptAt || 0) - Date.now(), nextCaptureAllowedAt - Date.now());
       if (waitMs > 0) {
@@ -787,11 +823,13 @@ export async function runServer(args, { session: injectedSession } = {}) {
         return;
       }
       captureInFlight = true;
+      let browserCaptureCompleted = false;
       try {
         const html = await session.captureRawHtml(item.url);
+        browserCaptureCompleted = true;
         await cache.set(item.url, html);
         lastSuccessfulCaptureAt = new Date().toISOString();
-        await clearLoginPause();
+        await clearRecoveryPause();
         const recoveredErrorKey = item.errorKey;
         retryItems = retryItems.filter((entry) => entry.id !== item.id);
         for (const queued of retryItems) {
@@ -804,14 +842,19 @@ export async function runServer(args, { session: injectedSession } = {}) {
       } catch (error) {
         item.attempts = Number(item.attempts || 0) + 1;
         item.lastError = String(error?.message || error);
-        const authenticationFailure = isAuthenticationFailure(error);
-        item.errorKey = authenticationFailure ? "eBay login required" : normalizeFailure(error);
-        item.waitingForLogin = authenticationFailure;
         item.updatedAt = new Date().toISOString();
-        if (authenticationFailure) {
-          await enterLoginPause(error);
-          item.nextAttemptAt = loginPause.probeAt;
+        if (!browserCaptureCompleted) {
+          const leaveFreshBrowserForLogin = browserAvailableForLogin && isAuthenticationFailure(error);
+          await enterRecoveryPause(error, { stopBrowser: !leaveFreshBrowserForLogin });
+          item.errorKey = recoveryPause.state === "waiting_for_login" ? "eBay login required" : "Headed browser restarting";
+          item.waitingForRecovery = true;
+          item.waitingForLogin = recoveryPause.state === "waiting_for_login";
+          item.nextAttemptAt = recoveryPause.probeAt;
+          await persistRetryItems();
         } else {
+          item.errorKey = normalizeFailure(error);
+          item.waitingForRecovery = false;
+          item.waitingForLogin = false;
           item.nextAttemptAt = new Date(Date.now() + retryDelayMs(item.attempts, args.retryBaseDelayMs, args.retryMaxDelayMs)).toISOString();
           await persistRetryItems();
         }
@@ -859,6 +902,17 @@ export async function runServer(args, { session: injectedSession } = {}) {
 
         const waitMs = Math.max(0, nextBatchStartAt - Date.now(), retryAt - Date.now());
         if (waitMs > 0) await new Promise((resolve) => setTimeout(resolve, waitMs));
+        let browserAvailableForLogin = false;
+        if (recoveryPause?.active) {
+          try {
+            await session.start?.();
+            browserAvailableForLogin = true;
+          } catch (error) {
+            await enterRecoveryPause(error);
+            retryAt = Date.parse(recoveryPause.probeAt);
+            continue;
+          }
+        }
 
         let captureRate = captureDailyRateLimiter.consume();
         if (!captureRate.allowed) {
@@ -870,12 +924,14 @@ export async function runServer(args, { session: injectedSession } = {}) {
 
         const startedAt = Date.now();
         captureInFlight = true;
+        let browserCaptureCompleted = false;
         try {
           attempt += 1;
           const html = await session.captureRawHtml(targetUrl);
+          browserCaptureCompleted = true;
           await cache.set(targetUrl, html);
           lastSuccessfulCaptureAt = new Date().toISOString();
-          await clearLoginPause();
+          await clearRecoveryPause();
           await appendBatchProgress(args.batchDir, meta.id, {
             index, status: "complete", bytes: Buffer.byteLength(html), cached: false,
             attempt, completedAt: new Date().toISOString()
@@ -887,14 +943,16 @@ export async function runServer(args, { session: injectedSession } = {}) {
           const errorKey = normalizeFailure(error);
           const sameErrorCount = (sameErrorCounts.get(errorKey) || 0) + 1;
           sameErrorCounts.set(errorKey, sameErrorCount);
-          const authenticationFailure = isAuthenticationFailure(error);
-          if (authenticationFailure) await enterLoginPause(error);
-          const delayMs = authenticationFailure ? args.loginRetryDelayMs : sameErrorCount >= args.retrySameErrorThreshold
+          if (!browserCaptureCompleted) {
+            const leaveFreshBrowserForLogin = browserAvailableForLogin && isAuthenticationFailure(error);
+            await enterRecoveryPause(error, { stopBrowser: !leaveFreshBrowserForLogin });
+          }
+          const delayMs = !browserCaptureCompleted ? args.loginRetryDelayMs : sameErrorCount >= args.retrySameErrorThreshold
             ? args.retryCircuitDelayMs
             : retryDelayMs(attempt, args.retryBaseDelayMs, args.retryMaxDelayMs);
           retryAt = Date.now() + delayMs;
           await appendBatchProgress(args.batchDir, meta.id, {
-            index, status: authenticationFailure ? "waiting_for_login" : "retrying", error: message, errorKey, attempt,
+            index, status: !browserCaptureCompleted ? recoveryPause.state : "retrying", error: message, errorKey, attempt,
             sameErrorCount, retryAt: new Date(retryAt).toISOString(), failedAt: new Date().toISOString()
           });
           if (sameErrorCount >= args.retrySameErrorThreshold) {
@@ -1002,12 +1060,12 @@ export async function runServer(args, { session: injectedSession } = {}) {
             ...(activeBatch.pauseReason ? { pauseReason: normalizeFailure(activeBatch.pauseReason) } : {})
           } : null,
           capture: { inFlight: captureInFlight, lastSuccessfulAt: lastSuccessfulCaptureAt },
-          login: loginPause?.active ? {
-            state: "waiting_for_login",
-            message: loginPause.message,
-            pausedAt: loginPause.startedAt,
-            nextProbeAt: loginPause.probeAt,
-            queuedDuringPause: retryItems.filter((item) => item.waitingForLogin).length
+          login: recoveryPause?.active ? {
+            state: recoveryPause.state || "waiting_for_login",
+            message: recoveryPause.message,
+            pausedAt: recoveryPause.startedAt,
+            nextProbeAt: recoveryPause.probeAt,
+            queuedDuringPause: retryItems.filter((item) => item.waitingForRecovery || item.waitingForLogin).length
           } : {
             state: "ready",
             message: null,
@@ -1017,6 +1075,7 @@ export async function runServer(args, { session: injectedSession } = {}) {
           },
           browserSession: {
             persistentProfile: browserSession.persistentProfile !== false,
+            browserRunning: browserSession.browserRunning !== false,
             cookieCount: Number.isInteger(browserSession.cookieCount) ? browserSession.cookieCount : null,
             lastInteractiveBlockAt
           }
@@ -1181,7 +1240,7 @@ export async function runServer(args, { session: injectedSession } = {}) {
           return;
         }
 
-        if (loginPause?.active) {
+        if (recoveryPause?.active) {
           const requestRate = requestDailyRateLimiter.consume();
           await persistRates();
           if (!requestRate.allowed) {
@@ -1193,8 +1252,8 @@ export async function runServer(args, { session: injectedSession } = {}) {
             res.end("Daily API request limit reached. Retry after the indicated delay.");
             return;
           }
-          const retry = await enqueueDirectRetry(targetUrl, "eBay login is pending", { waitingForLogin: true, countAttempt: false });
-          const retryAfterSeconds = Math.max(1, Math.ceil((Date.parse(loginPause.probeAt) - Date.now()) / 1_000));
+          const retry = await enqueueDirectRetry(targetUrl, recoveryPause.message, { waitingForRecovery: true, countAttempt: false });
+          const retryAfterSeconds = Math.max(1, Math.ceil((Date.parse(recoveryPause.probeAt) - Date.now()) / 1_000));
           res.writeHead(202, {
             "content-type": "application/json; charset=utf-8",
             "cache-control": "no-store",
@@ -1202,10 +1261,10 @@ export async function runServer(args, { session: injectedSession } = {}) {
             "x-retry-id": retry.id
           });
           res.end(JSON.stringify({
-            status: "waiting_for_login",
-            message: "Please Wait, Logging In",
+            status: recoveryPause.state,
+            message: recoveryPause.message,
             retryId: retry.id,
-            retryAt: loginPause.probeAt
+            retryAt: recoveryPause.probeAt
           }));
           return;
         }
@@ -1261,27 +1320,28 @@ export async function runServer(args, { session: injectedSession } = {}) {
 
         captureInFlight = true;
         let html;
+        let browserCaptureCompleted = false;
         try {
           const waitMs = Math.max(0, nextCaptureAllowedAt - Date.now());
           if (waitMs > 0) await new Promise((resolve) => setTimeout(resolve, waitMs));
           html = await session.captureRawHtml(targetUrl);
+          browserCaptureCompleted = true;
           await cache.set(targetUrl, html);
           lastSuccessfulCaptureAt = new Date().toISOString();
-          await clearLoginPause();
+          await clearRecoveryPause();
         } catch (error) {
-          const authenticationFailure = isAuthenticationFailure(error);
-          if (authenticationFailure) await enterLoginPause(error);
-          const retry = await enqueueDirectRetry(targetUrl, error, { waitingForLogin: authenticationFailure });
+          if (!browserCaptureCompleted) await enterRecoveryPause(error);
+          const retry = await enqueueDirectRetry(targetUrl, error, { waitingForRecovery: !browserCaptureCompleted });
           const retryAfterSeconds = Math.max(1, Math.ceil((Date.parse(retry.nextAttemptAt) - Date.now()) / 1_000));
-          res.writeHead(authenticationFailure ? 202 : 503, {
+          res.writeHead(!browserCaptureCompleted ? 202 : 503, {
             "content-type": "application/json; charset=utf-8",
             "cache-control": "no-store",
             "retry-after": String(retryAfterSeconds),
             "x-retry-id": retry.id
           });
-          res.end(JSON.stringify(authenticationFailure ? {
-            status: "waiting_for_login",
-            message: "Please Wait, Logging In",
+          res.end(JSON.stringify(!browserCaptureCompleted ? {
+            status: recoveryPause.state,
+            message: recoveryPause.message,
             retryId: retry.id,
             retryAt: retry.nextAttemptAt
           } : {

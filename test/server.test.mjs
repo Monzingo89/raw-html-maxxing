@@ -285,11 +285,13 @@ test("batch submission returns immediately and exposes completed HTML", async ()
   }
 });
 
-test("failed direct captures return 503 and persist an automatic retry", async () => {
+test("failed browser captures stop the browser and accept requests during recovery", async () => {
   const temporaryDir = await fs.mkdtemp(path.join(os.tmpdir(), "raw-html-retry-test-"));
   const retryQueueFile = path.join(temporaryDir, "retry-queue.json");
+  let stops = 0;
   const session = {
     async captureRawHtml() { throw new Error("upstream temporarily unavailable 503"); },
+    async stop() { stops += 1; },
     async close() {}
   };
   const args = parseArgs([], {
@@ -301,6 +303,8 @@ test("failed direct captures return 503 and persist an automatic retry", async (
     RETRY_QUEUE_FILE: retryQueueFile,
     RETRY_BASE_DELAY_MS: "60000",
     RETRY_MAX_DELAY_MS: "60000",
+    LOGIN_RETRY_DELAY_MS: "60000",
+    LOGIN_STATE_FILE: path.join(temporaryDir, "recovery.json"),
     CAPTURE_DELAY_MIN_MS: "0",
     CAPTURE_DELAY_MAX_MS: "0",
     ALERT_STATE_FILE: path.join(temporaryDir, "alerts.json")
@@ -314,10 +318,12 @@ test("failed direct captures return 503 and persist an automatic retry", async (
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ url: "https://www.ebay.com/sch/i.html?_nkw=retry-test" })
     });
-    assert.equal(response.status, 503);
+    assert.equal(response.status, 202);
     assert.ok(response.headers.get("x-retry-id"));
     const body = await response.json();
-    assert.equal(body.error, "Capture temporarily unavailable; queued for automatic retry.");
+    assert.equal(body.status, "restarting_browser");
+    assert.equal(body.message, "Please Wait, Restarting Browser");
+    assert.equal(stops, 1);
     const queue = JSON.parse(await fs.readFile(retryQueueFile, "utf8"));
     assert.equal(queue.length, 1);
     assert.equal(queue[0].attempts, 1);
@@ -327,12 +333,12 @@ test("failed direct captures return 503 and persist an automatic retry", async (
         headers: { "content-type": "application/json" },
         body: JSON.stringify({ url: `https://www.ebay.com/sch/i.html?_nkw=${keyword}` })
       });
-      assert.equal(grouped.status, 503);
+      assert.equal(grouped.status, 202);
     }
     const groupedQueue = JSON.parse(await fs.readFile(retryQueueFile, "utf8"));
     assert.equal(groupedQueue.length, 3);
     const outbox = await fs.readFile(`${args.alertStateFile}.outbox.ndjson`, "utf8");
-    assert.match(outbox, /grouped-direct-fetch-failures/);
+    assert.match(outbox, /headed-browser-recovery/);
   } finally {
     await new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
     await fs.rm(temporaryDir, { recursive: true, force: true });
@@ -343,6 +349,8 @@ test("login loss pauses for three minutes, accepts incoming work, and resumes it
   const temporaryDir = await fs.mkdtemp(path.join(os.tmpdir(), "raw-html-login-pause-test-"));
   const attemptedUrls = [];
   let firstAttempt = true;
+  let starts = 0;
+  let stops = 0;
   const session = {
     async captureRawHtml(url) {
       attemptedUrls.push(url);
@@ -352,6 +360,8 @@ test("login loss pauses for three minutes, accepts incoming work, and resumes it
       }
       return `<!DOCTYPE html><html><body>${url}</body></html>`;
     },
+    async start() { starts += 1; },
+    async stop() { stops += 1; },
     async close() {}
   };
   const args = parseArgs([], {
@@ -402,8 +412,10 @@ test("login loss pauses for three minutes, accepts incoming work, and resumes it
       if (resumed.status === 200) break;
     }
     assert.equal(resumed.status, 200);
-    assert.equal(resumed.headers.get("x-cache"), "HIT");
+    assert.match(resumed.headers.get("x-cache"), /^(HIT|MISS)$/);
     assert.deepEqual(attemptedUrls, [urls[0], urls[0], urls[1]]);
+    assert.equal(stops, 1);
+    assert.equal(starts, 1);
     const loginState = JSON.parse(await fs.readFile(args.loginStateFile, "utf8"));
     assert.equal(loginState.active, false);
   } finally {

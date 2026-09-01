@@ -117,13 +117,13 @@ and retry that same URL. Accepted uncached captures count toward the shared
 consume that allowance. Do not run dynamic uncached requests while a bulk batch
 is active—the batch has priority.
 
-If an upstream page fails, `POST /api/fetch` returns HTTP `503` with
-`Retry-After` and `X-Retry-Id`. The URL is stored in the VM's persistent retry
-queue. Retry the same URL after the indicated delay; once the background retry
-succeeds, the HTML is returned from cache. Batch failures remain `retrying`,
-back off exponentially, and are not discarded as terminal failures. Three
-matching errors open a five-minute circuit; a successful probe releases
-matching queued work immediately.
+If a headed-browser capture fails, the failed Chromium context is closed and
+the gateway enters a persistent three-minute restart pause. New dynamic requests
+remain accepted in arrival order and receive HTTP `202` with
+`Please Wait, Restarting Browser`, a retry ID, and the restart time. The gateway
+then launches a fresh headed browser and releases the queued URLs after its first
+successful capture. Cache, disk, and other infrastructure failures remain HTTP
+`503` retries and do not cause a browser-restart loop.
 
 If eBay requires login or interactive verification, the gateway enters a
 persistent three-minute login pause. New dynamic requests remain accepted in
