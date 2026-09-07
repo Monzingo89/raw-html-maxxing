@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { bearerTokenMatches, createHtmlCache, createRateLimiter, createRollingRateLimiter, htmlCacheStats, isAuthenticationFailure, isInteractiveBlock, latestBatchEvents, minimumCaptureLength, nextBatchCaptureAt, normalizeFailure, outputFilename, parseAndValidateTargetUrl, parseArgs, parseDistinctBatchUrls, randomDelayMs, retryDelayMs, runServer } from "../src/server.mjs";
+import { bearerTokenMatches, createFailureLogger, createHtmlCache, createRateLimiter, createRollingRateLimiter, htmlCacheStats, isAuthenticationFailure, isInteractiveBlock, latestBatchEvents, minimumCaptureLength, nextBatchCaptureAt, normalizeFailure, outputFilename, parseAndValidateTargetUrl, parseArgs, parseDistinctBatchUrls, randomDelayMs, retryDelayMs, runServer } from "../src/server.mjs";
 
 test("accepts eBay and its subdomains", () => {
   assert.equal(
@@ -42,6 +42,7 @@ test("environment and CLI options are parsed", () => {
     DAILY_RATE_LIMIT_MAX: "1000",
     CAPTURE_DAILY_RATE_LIMIT_MAX: "300",
     LOGIN_RETRY_DELAY_MS: "180000",
+    FAILURE_LOG_DIR: "/tmp/raw-html-test-failures",
     ADMIN_STATUS_TOKEN: "admin-test-token"
   });
   assert.equal(args.headless, true);
@@ -50,9 +51,38 @@ test("environment and CLI options are parsed", () => {
   assert.equal(args.dailyRateLimitMax, 1000);
   assert.equal(args.captureDailyRateLimitMax, 300);
   assert.equal(args.loginRetryDelayMs, 180_000);
+  assert.equal(args.failureLogDir, "/tmp/raw-html-test-failures");
   assert.equal(args.verificationTimeoutMs, 0);
   assert.equal(args.adminStatusToken, "admin-test-token");
   assert.deepEqual(args.allowHosts, ["ebay.com"]);
+});
+
+test("failure logger writes one detailed redacted text file per error", async () => {
+  const temporaryDir = await fs.mkdtemp(path.join(os.tmpdir(), "raw-html-failure-log-test-"));
+  try {
+    const logger = createFailureLogger({ failureLogDir: temporaryDir, instanceName: "test-vm" });
+    const error = new Error("capture failed authorization=Bearer real-secret-token", {
+      cause: Object.assign(new Error("socket failed password=hunter2"), { code: "ECONNRESET" })
+    });
+    const file = await logger.write("direct capture", error, {
+      targetUrl: "https://www.ebay.com/sch/i.html?_nkw=pikachu",
+      authorization: "Bearer another-secret",
+      cookieValue: "private-cookie",
+      retryQueueCount: 3
+    });
+    const report = await fs.readFile(file, "utf8");
+    assert.match(path.basename(file), /_direct-capture_[0-9a-f-]+\.txt$/);
+    assert.match(report, /Raw HTML Maxxing failure report/);
+    assert.match(report, /ECONNRESET/);
+    assert.match(report, /retryQueueCount/);
+    assert.match(report, /https:\/\/www\.ebay\.com\/sch\/i\.html/);
+    assert.doesNotMatch(report, /real-secret-token|another-secret|private-cookie|hunter2/);
+    assert.equal((await fs.stat(temporaryDir)).mode & 0o777, 0o700);
+    assert.equal((await fs.stat(file)).mode & 0o777, 0o600);
+    assert.deepEqual(await logger.stats(), { directory: temporaryDir, count: 1, latestFile: path.basename(file) });
+  } finally {
+    await fs.rm(temporaryDir, { recursive: true, force: true });
+  }
 });
 
 test("admin bearer tokens use exact constant-time matching", () => {
@@ -203,7 +233,8 @@ test("admin status is private and returns operational data without cookie values
     CACHE_DIR: path.join(temporaryDir, "cache"),
     RATE_LIMIT_STATE_FILE: path.join(temporaryDir, "rates.json"),
     BATCH_DIR: path.join(temporaryDir, "batches"),
-    RETRY_QUEUE_FILE: path.join(temporaryDir, "retry.json")
+    RETRY_QUEUE_FILE: path.join(temporaryDir, "retry.json"),
+    FAILURE_LOG_DIR: path.join(temporaryDir, "failure-logs")
   });
   args.port = 0;
   const server = await runServer(args, { session });
@@ -217,6 +248,7 @@ test("admin status is private and returns operational data without cookie values
     const body = await response.json();
     assert.equal(body.instanceName, "test-vm");
     assert.equal(body.html.files, 0);
+    assert.deepEqual(body.failureLogs, { directory: args.failureLogDir, count: 0, latestFile: null });
     assert.deepEqual(body.usage.requests, { used: 0, limit: 10_000 });
     assert.equal(body.browserSession.cookieCount, 7);
     assert.equal(JSON.stringify(body).includes("cookieValue"), false);
@@ -305,6 +337,7 @@ test("failed browser captures stop the browser and accept requests during recove
     RETRY_MAX_DELAY_MS: "60000",
     LOGIN_RETRY_DELAY_MS: "60000",
     LOGIN_STATE_FILE: path.join(temporaryDir, "recovery.json"),
+    FAILURE_LOG_DIR: path.join(temporaryDir, "failure-logs"),
     CAPTURE_DELAY_MIN_MS: "0",
     CAPTURE_DELAY_MAX_MS: "0",
     ALERT_STATE_FILE: path.join(temporaryDir, "alerts.json")
@@ -327,6 +360,9 @@ test("failed browser captures stop the browser and accept requests during recove
     const queue = JSON.parse(await fs.readFile(retryQueueFile, "utf8"));
     assert.equal(queue.length, 1);
     assert.equal(queue[0].attempts, 1);
+    const failureReports = await fs.readdir(args.failureLogDir);
+    assert.equal(failureReports.length, 1);
+    assert.match(await fs.readFile(path.join(args.failureLogDir, failureReports[0]), "utf8"), /retry-test/);
     for (const keyword of ["retry-test-two", "retry-test-three"]) {
       const grouped = await fetch(`http://127.0.0.1:${port}/api/fetch`, {
         method: "POST",
@@ -376,6 +412,7 @@ test("login loss takes a three-minute break without queueing incoming work", asy
     RATE_LIMIT_STATE_FILE: path.join(temporaryDir, "rates.json"),
     RETRY_QUEUE_FILE: path.join(temporaryDir, "retry.json"),
     LOGIN_STATE_FILE: path.join(temporaryDir, "login.json"),
+    FAILURE_LOG_DIR: path.join(temporaryDir, "failure-logs"),
     ALERT_STATE_FILE: path.join(temporaryDir, "alerts.json"),
     LOGIN_RETRY_DELAY_MS: "1000",
     RETRY_BASE_DELAY_MS: "1000",

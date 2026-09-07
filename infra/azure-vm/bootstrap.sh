@@ -55,6 +55,7 @@ fi
 
 npm --prefix "$APP_DIR" ci --omit=dev
 install -d -o "$APP_USER" -g "$APP_USER" -m 0700 "$APP_HOME/browser-profile"
+install -d -o "$APP_USER" -g "$APP_USER" -m 0700 "$APP_HOME/failure-logs"
 chown -R "$APP_USER:$APP_USER" "$APP_DIR"
 
 cat > /etc/systemd/system/raw-html-display.service <<'UNIT'
@@ -164,6 +165,7 @@ Environment=RETRY_CIRCUIT_DELAY_MS=300000
 Environment=LOGIN_RETRY_DELAY_MS=180000
 Environment=LOGIN_STATE_FILE=/var/lib/raw-html-maxxing/login-state.json
 Environment=ALERT_STATE_FILE=/var/lib/raw-html-maxxing/alert-state.json
+Environment=FAILURE_LOG_DIR=/var/lib/raw-html-maxxing/failure-logs
 Environment=ALERT_COOLDOWN_MS=3600000
 Environment=INSTANCE_NAME=%H
 EnvironmentFile=-/etc/raw-html-alert.env

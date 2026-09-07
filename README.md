@@ -143,6 +143,18 @@ RESEND_API_KEY=re_...
 Without those values, alerts are preserved in
 `/var/lib/raw-html-maxxing/alert-state.json.outbox.ndjson` but cannot be emailed.
 
+Every handled browser, retry-worker, batch, and internal request failure also
+creates its own detailed text report under
+`/var/lib/raw-html-maxxing/failure-logs`. Reports include the complete error
+stack and cause chain, request or batch context, retry state, and process
+diagnostics. Credentials, cookies, authorization values, and HTML bodies are
+redacted. The directory is mode `0700` and each report is mode `0600`.
+
+```bash
+sudo ls -lt /var/lib/raw-html-maxxing/failure-logs
+sudo sed -n '1,240p' /var/lib/raw-html-maxxing/failure-logs/REPORT.txt
+```
+
 ## Keep VM screen sharing available
 
 The VM bootstrap runs `x11vnc` with `-forever -shared` under an always-restarting

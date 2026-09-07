@@ -53,6 +53,7 @@ export function parseArgs(argv, env = process.env) {
     loginRetryDelayMs: Number(env.LOGIN_RETRY_DELAY_MS || 180_000),
     loginStateFile: path.resolve(env.LOGIN_STATE_FILE || path.join(rootDir, ".tmp/login-state.json")),
     alertStateFile: path.resolve(env.ALERT_STATE_FILE || path.join(rootDir, ".tmp/alert-state.json")),
+    failureLogDir: path.resolve(env.FAILURE_LOG_DIR || path.join(rootDir, ".tmp/failure-logs")),
     alertCooldownMs: Number(env.ALERT_COOLDOWN_MS || 3_600_000),
     alertEmailTo: String(env.ALERT_EMAIL_TO || "").trim(),
     alertEmailFrom: String(env.ALERT_EMAIL_FROM || "").trim(),
@@ -199,6 +200,107 @@ export function normalizeFailure(error) {
     .slice(0, 500);
 }
 
+const sensitiveDiagnosticKey = /authorization|cookie|password|passwd|secret|token|api[-_]?key|html|requestbody|responsebody/i;
+
+function redactDiagnosticString(value) {
+  return String(value)
+    .replace(/\bBearer\s+[A-Za-z0-9._~+/=-]+/gi, "Bearer [REDACTED]")
+    .replace(/((?:password|passwd|secret|token|api[-_]?key|authorization|cookie)\s*[=:]\s*)[^\s,;]+/gi, "$1[REDACTED]")
+    .replace(/([a-z][a-z0-9+.-]*:\/\/)[^/\s:@]+:[^/\s@]+@/gi, "$1[REDACTED]@");
+}
+
+function sanitizeDiagnosticValue(value, key = "", depth = 0) {
+  if (sensitiveDiagnosticKey.test(key)) return "[REDACTED]";
+  if (value === null || value === undefined || typeof value === "boolean" || typeof value === "number") return value;
+  if (typeof value === "string") return redactDiagnosticString(value).slice(0, 100_000);
+  if (depth >= 8) return "[MAX DEPTH REACHED]";
+  if (Array.isArray(value)) return value.slice(0, 1_000).map((entry) => sanitizeDiagnosticValue(entry, "", depth + 1));
+  if (typeof value === "object") {
+    return Object.fromEntries(Object.entries(value).slice(0, 1_000)
+      .map(([entryKey, entryValue]) => [entryKey, sanitizeDiagnosticValue(entryValue, entryKey, depth + 1)]));
+  }
+  return redactDiagnosticString(value);
+}
+
+function diagnosticError(error, depth = 0) {
+  if (depth >= 8) return { message: "[MAX CAUSE DEPTH REACHED]" };
+  if (!(error instanceof Error)) return { message: redactDiagnosticString(error) };
+  const report = {
+    name: error.name,
+    message: redactDiagnosticString(error.message),
+    ...(error.code !== undefined ? { code: redactDiagnosticString(error.code) } : {}),
+    ...(error.errno !== undefined ? { errno: error.errno } : {}),
+    ...(error.syscall !== undefined ? { syscall: redactDiagnosticString(error.syscall) } : {}),
+    ...(error.path !== undefined ? { path: redactDiagnosticString(error.path) } : {}),
+    ...(error.address !== undefined ? { address: redactDiagnosticString(error.address) } : {}),
+    ...(error.port !== undefined ? { port: error.port } : {}),
+    stack: redactDiagnosticString(error.stack || error.message)
+  };
+  if (error.cause !== undefined) report.cause = diagnosticError(error.cause, depth + 1);
+  return report;
+}
+
+export function createFailureLogger({ failureLogDir, instanceName }) {
+  const write = async (kind, error, context = {}) => {
+    const now = new Date();
+    const failureId = crypto.randomUUID();
+    const safeKind = String(kind || "failure").toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "").slice(0, 80) || "failure";
+    const filename = `${now.toISOString().replace(/[:.]/g, "-")}_${safeKind}_${failureId}.txt`;
+    const report = {
+      failureId,
+      capturedAt: now.toISOString(),
+      instanceName,
+      kind: safeKind,
+      error: diagnosticError(error),
+      context: sanitizeDiagnosticValue(context),
+      process: {
+        pid: process.pid,
+        node: process.version,
+        platform: process.platform,
+        architecture: process.arch,
+        uptimeSeconds: process.uptime(),
+        workingDirectory: process.cwd(),
+        memoryUsage: process.memoryUsage()
+      }
+    };
+    await fs.mkdir(failureLogDir, { recursive: true, mode: 0o700 });
+    await fs.chmod(failureLogDir, 0o700);
+    const file = path.join(failureLogDir, filename);
+    const handle = await fs.open(file, "wx", 0o600);
+    try {
+      await handle.writeFile([
+        "Raw HTML Maxxing failure report",
+        "================================",
+        `Failure ID: ${failureId}`,
+        `Captured at: ${report.capturedAt}`,
+        `Instance: ${instanceName}`,
+        `Kind: ${safeKind}`,
+        "",
+        JSON.stringify(report, null, 2),
+        ""
+      ].join("\n"), "utf8");
+    } finally {
+      await handle.close();
+    }
+    return file;
+  };
+
+  const stats = async () => {
+    try {
+      const entries = (await fs.readdir(failureLogDir, { withFileTypes: true }))
+        .filter((entry) => entry.isFile() && entry.name.endsWith(".txt"))
+        .map((entry) => entry.name)
+        .sort();
+      return { directory: failureLogDir, count: entries.length, latestFile: entries.at(-1) || null };
+    } catch (error) {
+      if (error?.code === "ENOENT") return { directory: failureLogDir, count: 0, latestFile: null };
+      throw error;
+    }
+  };
+
+  return { write, stats };
+}
+
 export function retryDelayMs(attempt, baseDelayMs, maxDelayMs) {
   return Math.min(maxDelayMs, baseDelayMs * (2 ** Math.max(0, attempt - 1)));
 }
@@ -218,7 +320,7 @@ async function readJsonFile(file, fallback) {
   }
 }
 
-function createAlertManager(args) {
+function createAlertManager(args, logFailure) {
   let stateQueue = Promise.resolve();
   const emit = (kind, message, details = {}) => {
     stateQueue = stateQueue.then(async () => {
@@ -256,6 +358,7 @@ function createAlertManager(args) {
       return delivered;
     }).catch((error) => {
       console.error(`[raw-html] alert delivery failed: ${String(error?.message || error)}`);
+      logFailure?.("alert-delivery", error, { alertStateFile: args.alertStateFile });
       return false;
     });
     return stateQueue;
@@ -655,7 +758,12 @@ function batchSummary(meta, events, includeItems = true) {
 }
 
 export async function runServer(args, { session: injectedSession } = {}) {
-  const alerts = createAlertManager(args);
+  const failureLogger = createFailureLogger(args);
+  const logFailure = (kind, error, context = {}) => failureLogger.write(kind, error, context).catch((logError) => {
+    console.error(`[raw-html] failure log write failed: ${String(logError?.message || logError)}`);
+    return null;
+  });
+  const alerts = createAlertManager(args, logFailure);
   args.onInteractiveBlock = async (state) => alerts.emit(
     "ebay-interactive-block",
     "eBay returned a sign-in, CAPTCHA, or human-verification page. Complete it through Screen Sharing.",
@@ -701,6 +809,7 @@ export async function runServer(args, { session: injectedSession } = {}) {
     if (retryTimer) clearTimeout(retryTimer);
     retryTimer = setTimeout(() => runRetryWorker().catch((error) => {
       console.error(`[raw-html] retry worker failed: ${String(error?.message || error)}`);
+      logFailure("retry-worker", error, { retryQueueCount: retryItems.length });
       scheduleRetryWorker(args.retryBaseDelayMs);
     }), Math.max(0, delayMs));
     retryTimer.unref?.();
@@ -710,6 +819,7 @@ export async function runServer(args, { session: injectedSession } = {}) {
     if (recoveryTimer) clearTimeout(recoveryTimer);
     recoveryTimer = setTimeout(() => resumeRecoveryPause().catch((error) => {
       console.error(`[raw-html] recovery resume failed: ${String(error?.message || error)}`);
+      logFailure("recovery-resume", error, { recoveryPause });
     }), Math.max(0, delayMs));
     recoveryTimer.unref?.();
   };
@@ -777,6 +887,7 @@ export async function runServer(args, { session: injectedSession } = {}) {
       await session.start?.();
       await clearRecoveryPause();
     } catch (error) {
+      await logFailure("recovery-browser-start", error, { recoveryPause, retryQueueCount: retryItems.length });
       await enterRecoveryPause(error);
     }
   }
@@ -847,6 +958,7 @@ export async function runServer(args, { session: injectedSession } = {}) {
           await session.start?.();
           browserAvailableForLogin = true;
         } catch (error) {
+          await logFailure("retry-browser-start", error, { retryItem: item, recoveryPause });
           await enterRecoveryPause(error);
           return;
         }
@@ -889,6 +1001,13 @@ export async function runServer(args, { session: injectedSession } = {}) {
           remainingQueued: retryItems.length
         });
       } catch (error) {
+        await logFailure("retry-capture", error, {
+          retryItem: item,
+          browserCaptureCompleted,
+          browserAvailableForLogin,
+          recoveryPause,
+          retryQueueCount: retryItems.length
+        });
         item.attempts = Number(item.attempts || 0) + 1;
         item.lastError = String(error?.message || error);
         item.updatedAt = new Date().toISOString();
@@ -957,6 +1076,7 @@ export async function runServer(args, { session: injectedSession } = {}) {
             await session.start?.();
             browserAvailableForLogin = true;
           } catch (error) {
+            await logFailure("batch-browser-start", error, { batchId: meta.id, index, targetUrl, attempt, recoveryPause });
             await enterRecoveryPause(error);
             retryAt = Date.parse(recoveryPause.probeAt);
             continue;
@@ -992,6 +1112,16 @@ export async function runServer(args, { session: injectedSession } = {}) {
           const errorKey = normalizeFailure(error);
           const sameErrorCount = (sameErrorCounts.get(errorKey) || 0) + 1;
           sameErrorCounts.set(errorKey, sameErrorCount);
+          await logFailure("batch-capture", error, {
+            batchId: meta.id,
+            index,
+            targetUrl,
+            attempt,
+            sameErrorCount,
+            browserCaptureCompleted,
+            browserAvailableForLogin,
+            recoveryPause
+          });
           if (!browserCaptureCompleted) {
             const leaveFreshBrowserForLogin = browserAvailableForLogin && isAuthenticationFailure(error);
             await enterRecoveryPause(error, { stopBrowser: !leaveFreshBrowserForLogin });
@@ -1024,6 +1154,7 @@ export async function runServer(args, { session: injectedSession } = {}) {
 
   const startBatch = (meta) => {
     batchRun = batchRun.then(() => processBatch(meta)).catch(async (error) => {
+      await logFailure("batch-run", error, { batchId: meta.id, status: meta.status, total: meta.urls.length });
       meta.status = "paused";
       meta.pauseReason = String(error?.message || error);
       await persistBatchMeta(meta).catch(() => {});
@@ -1070,9 +1201,10 @@ export async function runServer(args, { session: injectedSession } = {}) {
           return;
         }
         const now = Date.now();
-        const [cacheStats, browserSession] = await Promise.all([
+        const [cacheStats, browserSession, failureLogs] = await Promise.all([
           htmlCacheStats(args.cacheDir),
-          session.getSessionStatus?.() || Promise.resolve({ persistentProfile: true, cookieCount: null })
+          session.getSessionStatus?.() || Promise.resolve({ persistentProfile: true, cookieCount: null }),
+          failureLogger.stats()
         ]);
         const requestEvents = requestDailyRateLimiter.snapshot(now);
         const captureEvents = captureDailyRateLimiter.snapshot(now);
@@ -1109,6 +1241,7 @@ export async function runServer(args, { session: injectedSession } = {}) {
             ...(activeBatch.pauseReason ? { pauseReason: normalizeFailure(activeBatch.pauseReason) } : {})
           } : null,
           capture: { inFlight: captureInFlight, lastSuccessfulAt: lastSuccessfulCaptureAt },
+          failureLogs,
           login: recoveryPause?.active ? {
             state: recoveryPause.state || "taking_a_break",
             message: recoveryPause.message,
@@ -1383,6 +1516,15 @@ export async function runServer(args, { session: injectedSession } = {}) {
           lastSuccessfulCaptureAt = new Date().toISOString();
           await clearRecoveryPause();
         } catch (error) {
+          await logFailure("direct-capture", error, {
+            method: req.method,
+            targetUrl,
+            clientIp,
+            browserCaptureCompleted,
+            recoveryPause,
+            retryQueueCount: retryItems.length,
+            activeBatchId: activeBatch?.id || null
+          });
           if (!browserCaptureCompleted) {
             await enterRecoveryPause(error);
             if (isAuthenticationFailure(error)) {
@@ -1433,6 +1575,9 @@ export async function runServer(args, { session: injectedSession } = {}) {
       const message = String(error?.message || error);
       const authRequired = /eBay authentication is required/i.test(message);
       const clientError = /valid URL|not allowed|HTTP|JSON|too large|Batch request|Batch URLs|cannot exceed/i.test(message);
+      if (!clientError && !authRequired) {
+        await logFailure("request-handler", error, { method: req.method, requestPath: req.url, remoteAddress: req.socket.remoteAddress });
+      }
       res.writeHead(authRequired ? 503 : clientError ? 400 : 500, { "content-type": "text/plain; charset=utf-8", "cache-control": "no-store" });
       res.end(message);
     }
