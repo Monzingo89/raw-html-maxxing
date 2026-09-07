@@ -663,6 +663,10 @@ export async function runServer(args, { session: injectedSession } = {}) {
   );
   let recoveryPause = await readJsonFile(args.loginStateFile, null);
   if (!recoveryPause?.active) recoveryPause = null;
+  if (recoveryPause?.state === "waiting_for_login") {
+    recoveryPause.state = "taking_a_break";
+    recoveryPause.message = "taking a break";
+  }
   const session = injectedSession || await createCaptureSession(args, { autoStart: !recoveryPause });
   const persistedRates = await readRateLimitState(args.stateFile);
   const clientRateLimiter = createRateLimiter(args.rateLimitMax, args.rateLimitWindowMs);
@@ -680,6 +684,7 @@ export async function runServer(args, { session: injectedSession } = {}) {
   let retryItems = await readJsonFile(args.retryQueueFile, []);
   if (!Array.isArray(retryItems)) retryItems = [];
   let retryTimer = null;
+  let recoveryTimer = null;
   let retryWorkerRunning = false;
   let lastSuccessfulCaptureAt = null;
   let lastInteractiveBlockAt = null;
@@ -701,14 +706,22 @@ export async function runServer(args, { session: injectedSession } = {}) {
     retryTimer.unref?.();
   };
 
+  const scheduleRecoveryResume = (delayMs) => {
+    if (recoveryTimer) clearTimeout(recoveryTimer);
+    recoveryTimer = setTimeout(() => resumeRecoveryPause().catch((error) => {
+      console.error(`[raw-html] recovery resume failed: ${String(error?.message || error)}`);
+    }), Math.max(0, delayMs));
+    recoveryTimer.unref?.();
+  };
+
   const enterRecoveryPause = async (error, { stopBrowser = true } = {}) => {
     const now = Date.now();
     const authenticationFailure = isAuthenticationFailure(error);
     const startedAt = recoveryPause?.startedAt || new Date(now).toISOString();
     recoveryPause = {
       active: true,
-      state: authenticationFailure ? "waiting_for_login" : "restarting_browser",
-      message: authenticationFailure ? "Please Wait, Logging In" : "Please Wait, Restarting Browser",
+      state: authenticationFailure ? "taking_a_break" : "restarting_browser",
+      message: authenticationFailure ? "taking a break" : "Please Wait, Restarting Browser",
       startedAt,
       probeAt: new Date(now + args.loginRetryDelayMs).toISOString(),
       lastError: normalizeFailure(error),
@@ -720,8 +733,11 @@ export async function runServer(args, { session: injectedSession } = {}) {
     }
     if (stopBrowser) await session.stop?.();
     await Promise.all([persistRecoveryPause(), persistRetryItems()]);
-    scheduleRetryWorker(args.loginRetryDelayMs);
-    await alerts.emit("headed-browser-recovery", "A failed headed browser was stopped; incoming requests remain queued until the three-minute restart probe.", {
+    if (authenticationFailure) scheduleRecoveryResume(args.loginRetryDelayMs);
+    else scheduleRetryWorker(args.loginRetryDelayMs);
+    await alerts.emit("headed-browser-recovery", authenticationFailure
+      ? "The eBay session is taking a three-minute break; incoming requests are rejected until the headed browser restarts."
+      : "A failed headed browser was stopped; incoming requests remain queued until the three-minute restart probe.", {
       error: recoveryPause.lastError, retryAt: recoveryPause.probeAt
     });
     return recoveryPause;
@@ -729,6 +745,10 @@ export async function runServer(args, { session: injectedSession } = {}) {
 
   const clearRecoveryPause = async () => {
     if (!recoveryPause?.active) return false;
+    if (recoveryTimer) {
+      clearTimeout(recoveryTimer);
+      recoveryTimer = null;
+    }
     recoveryPause = null;
     const now = new Date().toISOString();
     for (const queued of retryItems) {
@@ -746,9 +766,38 @@ export async function runServer(args, { session: injectedSession } = {}) {
     return true;
   };
 
+  async function resumeRecoveryPause() {
+    if (!recoveryPause?.active || recoveryPause.state !== "taking_a_break") return;
+    const remainingMs = Date.parse(recoveryPause.probeAt) - Date.now();
+    if (remainingMs > 0) {
+      scheduleRecoveryResume(remainingMs);
+      return;
+    }
+    try {
+      await session.start?.();
+      await clearRecoveryPause();
+    } catch (error) {
+      await enterRecoveryPause(error);
+    }
+  }
+
+  const sendTakingBreak = (res) => {
+    const retryAfterSeconds = Math.max(1, Math.ceil((Date.parse(recoveryPause.probeAt) - Date.now()) / 1_000));
+    res.writeHead(503, {
+      "content-type": "application/json; charset=utf-8",
+      "cache-control": "no-store",
+      "retry-after": String(retryAfterSeconds)
+    });
+    res.end(JSON.stringify({
+      status: "taking_a_break",
+      message: "taking a break",
+      retryAt: recoveryPause.probeAt
+    }));
+  };
+
   const enqueueDirectRetry = async (targetUrl, error, { waitingForRecovery = false, countAttempt = true } = {}) => {
     const now = Date.now();
-    const errorKey = waitingForRecovery ? (recoveryPause?.state === "waiting_for_login" ? "eBay login required" : "Headed browser restarting") : normalizeFailure(error);
+    const errorKey = waitingForRecovery ? (recoveryPause?.state === "taking_a_break" ? "eBay login required" : "Headed browser restarting") : normalizeFailure(error);
     let item = retryItems.find((entry) => entry.url === targetUrl);
     if (!item) {
       item = { id: crypto.randomUUID(), url: targetUrl, createdAt: new Date(now).toISOString(), attempts: 0 };
@@ -758,7 +807,7 @@ export async function runServer(args, { session: injectedSession } = {}) {
     item.lastError = String(error?.message || error);
     item.errorKey = errorKey;
     item.waitingForRecovery = waitingForRecovery;
-    item.waitingForLogin = waitingForRecovery && recoveryPause?.state === "waiting_for_login";
+    item.waitingForLogin = waitingForRecovery && recoveryPause?.state === "taking_a_break";
     item.updatedAt = new Date(now).toISOString();
     const sameErrorCount = retryItems.filter((entry) => entry.errorKey === errorKey).length;
     item.nextAttemptAt = waitingForRecovery && recoveryPause?.active ? recoveryPause.probeAt : new Date(now + (sameErrorCount >= args.retrySameErrorThreshold
@@ -846,9 +895,9 @@ export async function runServer(args, { session: injectedSession } = {}) {
         if (!browserCaptureCompleted) {
           const leaveFreshBrowserForLogin = browserAvailableForLogin && isAuthenticationFailure(error);
           await enterRecoveryPause(error, { stopBrowser: !leaveFreshBrowserForLogin });
-          item.errorKey = recoveryPause.state === "waiting_for_login" ? "eBay login required" : "Headed browser restarting";
+          item.errorKey = recoveryPause.state === "taking_a_break" ? "eBay login required" : "Headed browser restarting";
           item.waitingForRecovery = true;
-          item.waitingForLogin = recoveryPause.state === "waiting_for_login";
+          item.waitingForLogin = recoveryPause.state === "taking_a_break";
           item.nextAttemptAt = recoveryPause.probeAt;
           await persistRetryItems();
         } else {
@@ -1061,7 +1110,7 @@ export async function runServer(args, { session: injectedSession } = {}) {
           } : null,
           capture: { inFlight: captureInFlight, lastSuccessfulAt: lastSuccessfulCaptureAt },
           login: recoveryPause?.active ? {
-            state: recoveryPause.state || "waiting_for_login",
+            state: recoveryPause.state || "taking_a_break",
             message: recoveryPause.message,
             pausedAt: recoveryPause.startedAt,
             nextProbeAt: recoveryPause.probeAt,
@@ -1241,6 +1290,10 @@ export async function runServer(args, { session: injectedSession } = {}) {
         }
 
         if (recoveryPause?.active) {
+          if (recoveryPause.state === "taking_a_break") {
+            sendTakingBreak(res);
+            return;
+          }
           const requestRate = requestDailyRateLimiter.consume();
           await persistRates();
           if (!requestRate.allowed) {
@@ -1330,7 +1383,13 @@ export async function runServer(args, { session: injectedSession } = {}) {
           lastSuccessfulCaptureAt = new Date().toISOString();
           await clearRecoveryPause();
         } catch (error) {
-          if (!browserCaptureCompleted) await enterRecoveryPause(error);
+          if (!browserCaptureCompleted) {
+            await enterRecoveryPause(error);
+            if (isAuthenticationFailure(error)) {
+              sendTakingBreak(res);
+              return;
+            }
+          }
           const retry = await enqueueDirectRetry(targetUrl, error, { waitingForRecovery: !browserCaptureCompleted });
           const retryAfterSeconds = Math.max(1, Math.ceil((Date.parse(retry.nextAttemptAt) - Date.now()) / 1_000));
           res.writeHead(!browserCaptureCompleted ? 202 : 503, {
@@ -1385,10 +1444,14 @@ export async function runServer(args, { session: injectedSession } = {}) {
   });
   console.log(`[raw-html] listening on http://${args.host}:${args.port}`);
   if (retryItems.length > 0) scheduleRetryWorker(0);
+  if (recoveryPause?.active && recoveryPause.state === "taking_a_break") {
+    scheduleRecoveryResume(Math.max(0, Date.parse(recoveryPause.probeAt) - Date.now()));
+  }
 
   const shutdown = async (signal) => {
     console.log(`[raw-html] ${signal}; shutting down`);
     if (retryTimer) clearTimeout(retryTimer);
+    if (recoveryTimer) clearTimeout(recoveryTimer);
     await new Promise((resolve) => server.close(resolve));
     await session.close();
   };

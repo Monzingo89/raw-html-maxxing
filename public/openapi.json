@@ -38,7 +38,7 @@
     "/api/fetch": {
       "post": {
         "summary": "Capture rendered HTML",
-        "description": "Dynamic request endpoint. Accepts one eBay URL and returns the complete rendered DOM directly as the text/html response body. Send the next request after the prior response finishes and honor Retry-After on HTTP 202, 429, or 503. If a headed-browser capture fails, its Chromium context is closed while incoming URLs continue entering the persistent queue. After three minutes, a fresh headed browser starts and resumes the queue in arrival order. Login failures use the same recovery window. Cache, disk, and other infrastructure failures remain HTTP 503 retries and do not restart the browser. Accepted uncached captures and retry attempts count toward the shared 10,000-capture rolling 24-hour allowance. Use the batch endpoint for a one-time bulk submission.",
+        "description": "Dynamic request endpoint. Accepts one eBay URL and returns the complete rendered DOM directly as the text/html response body. Send the next request after the prior response finishes and honor Retry-After on HTTP 202, 429, or 503. If a headed-browser capture fails, its Chromium context is closed while incoming URLs continue entering the persistent queue. After three minutes, a fresh headed browser starts and resumes that infrastructure-recovery queue in arrival order. If eBay requires login, requests are not queued: the gateway returns HTTP 503 with taking a break and starts the headed browser again after three minutes. Cache, disk, and other infrastructure failures remain HTTP 503 retries and do not restart the browser. Accepted uncached captures and retry attempts count toward the shared 10,000-capture rolling 24-hour allowance. Use the batch endpoint for a one-time bulk submission.",
         "operationId": "captureRenderedHtml",
         "requestBody": {
           "required": true,
@@ -85,7 +85,7 @@
             }
           },
           "202": {
-            "description": "The URL was accepted into the persistent queue while the headed browser or eBay login is being restored.",
+            "description": "The URL was accepted into the persistent queue while the headed browser is being restored after an infrastructure failure.",
             "headers": {
               "Retry-After": { "description": "Seconds until the headed-browser restart probe.", "schema": { "type": "integer", "minimum": 1 } },
               "X-Retry-Id": { "description": "Persistent retry identifier.", "schema": { "type": "string", "format": "uuid" } }
@@ -94,8 +94,7 @@
               "application/json": {
                 "schema": { "type": "object" },
                 "examples": {
-                  "browserRestart": { "value": { "status": "restarting_browser", "message": "Please Wait, Restarting Browser", "retryId": "00000000-0000-4000-8000-000000000000", "retryAt": "2026-09-01T18:03:00.000Z" } },
-                  "login": { "value": { "status": "waiting_for_login", "message": "Please Wait, Logging In", "retryId": "00000000-0000-4000-8000-000000000000", "retryAt": "2026-09-01T18:03:00.000Z" } }
+                  "browserRestart": { "value": { "status": "restarting_browser", "message": "Please Wait, Restarting Browser", "retryId": "00000000-0000-4000-8000-000000000000", "retryAt": "2026-09-01T18:03:00.000Z" } }
                 }
               }
             }
@@ -126,15 +125,18 @@
             }
           },
           "503": {
-            "description": "Capture is temporarily unavailable and has been added to the persistent retry queue.",
+            "description": "Capture is temporarily unavailable. Infrastructure failures are queued for retry; login breaks are not queued.",
             "headers": {
               "Retry-After": { "description": "Seconds until the next automatic attempt.", "schema": { "type": "integer", "minimum": 1 } },
-              "X-Retry-Id": { "description": "Persistent retry identifier.", "schema": { "type": "string", "format": "uuid" } }
+              "X-Retry-Id": { "description": "Persistent retry identifier for queued infrastructure failures; omitted during a login break.", "schema": { "type": "string", "format": "uuid" } }
             },
             "content": {
               "application/json": {
                 "schema": { "type": "object" },
-                "example": { "error": "Capture temporarily unavailable; queued for automatic retry.", "retryId": "00000000-0000-4000-8000-000000000000", "retryAt": "2026-08-30T18:00:00.000Z" }
+                "examples": {
+                  "queuedFailure": { "value": { "error": "Capture temporarily unavailable; queued for automatic retry.", "retryId": "00000000-0000-4000-8000-000000000000", "retryAt": "2026-09-02T18:00:00.000Z" } },
+                  "loginBreak": { "value": { "status": "taking_a_break", "message": "taking a break", "retryAt": "2026-09-02T18:03:00.000Z" } }
+                }
               }
             }
           },

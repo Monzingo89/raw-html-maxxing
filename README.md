@@ -126,10 +126,10 @@ successful capture. Cache, disk, and other infrastructure failures remain HTTP
 `503` retries and do not cause a browser-restart loop.
 
 If eBay requires login or interactive verification, the gateway enters a
-persistent three-minute login pause. New dynamic requests remain accepted in
-arrival order and receive HTTP `202` with `Please Wait, Logging In`, a retry ID,
-and the next probe time. The first successful probe releases the queued URLs
-immediately so processing continues from the point where authentication stopped.
+persistent three-minute break. Dynamic requests are not queued during that
+window; they receive HTTP `503` with `taking a break`, `Retry-After`, and the
+restart time. The headed browser starts again automatically after three minutes,
+then the gateway continues accepting new requests.
 
 Operational alerts are deduplicated for one hour. Configure email delivery on
 each VM in `/etc/raw-html-alert.env`:
@@ -157,6 +157,12 @@ open 'vnc://127.0.0.1:5901'
 Leave both processes open while a batch is running. The VM-side VNC service
 automatically restarts if it exits; the localhost binding keeps the VNC port
 off the public internet.
+
+The bootstrap also installs a checksum-verified Chrome build and places the
+package on hold. Run the same bootstrap revision on every capture VM when
+changing Chrome so browser fingerprints cannot drift between independent eBay
+sessions. Override `GOOGLE_CHROME_VERSION` and `GOOGLE_CHROME_SHA256` together
+only after validating a replacement build on both VMs.
 
 Do not put the eBay URL on the GitHub Pages query string. GitHub Pages is static
 and does not process `?url=...` parameters.

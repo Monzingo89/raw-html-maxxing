@@ -6,11 +6,13 @@ APP_USER=rawhtml
 APP_HOME=/var/lib/raw-html-maxxing
 APP_HOST=${APP_HOST:-raw-html-maxxing-dd899e.centralus.cloudapp.azure.com}
 REPO_URL=https://github.com/Monzingo89/raw-html-maxxing.git
+GOOGLE_CHROME_VERSION=${GOOGLE_CHROME_VERSION:-151.0.7922.173-1}
+GOOGLE_CHROME_SHA256=${GOOGLE_CHROME_SHA256:-878e5ab495b8a694980fca61bc09b37e651ccedce2291c73434d16e48a2646fd}
 
 export DEBIAN_FRONTEND=noninteractive
 
 apt-get update
-apt-get install -y ca-certificates curl debian-keyring debian-archive-keyring apt-transport-https gnupg git fluxbox x11vnc xvfb
+apt-get install -y ca-certificates curl debian-keyring debian-archive-keyring apt-transport-https gnupg git fluxbox scrot xdotool x11vnc xvfb
 
 curl -fsSL https://deb.nodesource.com/setup_22.x | bash -
 apt-get install -y nodejs
@@ -23,7 +25,19 @@ curl -fsSL https://dl.cloudsmith.io/public/caddy/stable/gpg.key | gpg --dearmor 
 curl -fsSL https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt > /etc/apt/sources.list.d/caddy-stable.list
 
 apt-get update
-apt-get install -y caddy google-chrome-stable
+apt-get install -y caddy
+
+# Keep every capture VM on the same browser build. Google Chrome's apt channel
+# can advance between bootstrap runs, and even a one-major-version difference
+# changes the browser fingerprint sent alongside our fixed user agent.
+chrome_deb=$(mktemp /tmp/google-chrome-stable.XXXXXX.deb)
+curl -fsSL --retry 3 --retry-delay 2 \
+  "https://dl.google.com/linux/chrome/deb/pool/main/g/google-chrome-stable/google-chrome-stable_${GOOGLE_CHROME_VERSION}_amd64.deb" \
+  -o "$chrome_deb"
+printf '%s  %s\n' "$GOOGLE_CHROME_SHA256" "$chrome_deb" | sha256sum --check --status
+apt-get install -y --allow-downgrades "$chrome_deb"
+rm -f "$chrome_deb"
+apt-mark hold google-chrome-stable
 
 if ! id "$APP_USER" >/dev/null 2>&1; then
   useradd --system --create-home --home-dir "$APP_HOME" --shell /bin/bash "$APP_USER"

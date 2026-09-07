@@ -345,7 +345,7 @@ test("failed browser captures stop the browser and accept requests during recove
   }
 });
 
-test("login loss pauses for three minutes, accepts incoming work, and resumes it in order", async () => {
+test("login loss takes a three-minute break without queueing incoming work", async () => {
   const temporaryDir = await fs.mkdtemp(path.join(os.tmpdir(), "raw-html-login-pause-test-"));
   const attemptedUrls = [];
   let firstAttempt = true;
@@ -397,13 +397,15 @@ test("login loss pauses for three minutes, accepts incoming work, and resumes it
   });
   try {
     const stopped = await request(urls[0]);
-    assert.equal(stopped.status, 202);
-    assert.equal((await stopped.json()).message, "Please Wait, Logging In");
+    assert.equal(stopped.status, 503);
+    assert.equal(stopped.headers.get("x-retry-id"), null);
+    assert.equal((await stopped.json()).message, "taking a break");
 
-    const acceptedWhilePaused = await request(urls[1]);
-    assert.equal(acceptedWhilePaused.status, 202);
-    assert.equal((await acceptedWhilePaused.json()).status, "waiting_for_login");
+    const rejectedWhilePaused = await request(urls[1]);
+    assert.equal(rejectedWhilePaused.status, 503);
+    assert.equal((await rejectedWhilePaused.json()).status, "taking_a_break");
     assert.equal(attemptedUrls.length, 1);
+    assert.deepEqual(JSON.parse(await fs.readFile(args.retryQueueFile, "utf8")), []);
 
     let resumed;
     for (let attempt = 0; attempt < 40; attempt += 1) {
@@ -413,7 +415,7 @@ test("login loss pauses for three minutes, accepts incoming work, and resumes it
     }
     assert.equal(resumed.status, 200);
     assert.match(resumed.headers.get("x-cache"), /^(HIT|MISS)$/);
-    assert.deepEqual(attemptedUrls, [urls[0], urls[0], urls[1]]);
+    assert.deepEqual(attemptedUrls, [urls[0], urls[1]]);
     assert.equal(stops, 1);
     assert.equal(starts, 1);
     const loginState = JSON.parse(await fs.readFile(args.loginStateFile, "utf8"));
